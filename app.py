@@ -24,9 +24,10 @@ import uuid
 from datetime import datetime
 
 import segno
-from PySide6.QtCore import QBuffer, QByteArray, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QGuiApplication,
     QIcon,
@@ -65,6 +66,7 @@ from PySide6.QtWidgets import (
 import bundle as bundle_mod
 import crypto
 import envelope
+import group_invite as invite_mod
 import i18n
 import paths
 import theme
@@ -159,7 +161,9 @@ _KIND_CONTACT = "contact"
 _KIND_GROUP = "group"
 
 
-def _wire_body_for(vault: "vault_mod.Vault", message: "vault_mod.Message") -> str:
+def _wire_body_for(
+    vault: "vault_mod.Vault", message: "vault_mod.Message", acked_group_ids: set[str] | None = None,
+) -> str:
     """
     The exact plaintext to hand to transport.send_message for this outgoing
     message, whether it is being sent for the first time or retried by
@@ -178,6 +182,15 @@ def _wire_body_for(vault: "vault_mod.Vault", message: "vault_mod.Message") -> st
     vault.Vault.queue_delete_request()) - so it always encodes as a "delete"
     control envelope naming the message it wants deleted (its client_msg_id,
     not its own local id), never as "text"/"file".
+
+    `acked_group_ids` (MainWindow._acked_group_ids): a group this vault
+    joined via invite (group.joined_invite_code is non-empty) keeps
+    attaching that code to every message sent to it until its gid appears
+    here - the owner's vault is the only place that can validate the code
+    (see vault.redeem_group_invite_locally), so every send/retry has to
+    keep proving invitation until that owner-side confirmation lands.
+    Never attached for a group this vault owns (joined_invite_code is
+    always "" there - an owner never redeems its own invite).
     """
     if message.is_delete_request:
         gname = ""
@@ -185,6 +198,16 @@ def _wire_body_for(vault: "vault_mod.Vault", message: "vault_mod.Message") -> st
             group = vault.get_group(message.group_id)
             gname = group.name if group is not None else ""
         return envelope.encode_delete(message.client_msg_id, gid=message.group_id, gname=gname)
+
+    invcode = message.pending_invcode  # a directly-added member's own onboarding code, if any
+    if not invcode and message.group_id:
+        group = vault.get_group(message.group_id)
+        if (
+            group is not None and group.joined_invite_code
+            and (acked_group_ids is None or group.id not in acked_group_ids)
+        ):
+            invcode = group.joined_invite_code
+
     if message.attachment_filename:
         try:
             data = base64.b64decode(message.body)
@@ -196,13 +219,14 @@ def _wire_body_for(vault: "vault_mod.Vault", message: "vault_mod.Message") -> st
             gname = group.name if group is not None else ""
         return envelope.encode_file(
             message.attachment_filename, message.attachment_mime, data,
-            gid=message.group_id, gname=gname, mid=message.client_msg_id,
+            gid=message.group_id, gname=gname, mid=message.client_msg_id, invcode=invcode,
         )
     if message.group_id:
         group = vault.get_group(message.group_id)
         gname = group.name if group is not None else ""
         return envelope.encode_text(
-            message.body, gid=message.group_id, gname=gname, mid=message.client_msg_id
+            message.body, gid=message.group_id, gname=gname,
+            mid=message.client_msg_id, invcode=invcode,
         )
     return envelope.encode_text(message.body, mid=message.client_msg_id)
 
@@ -369,28 +393,33 @@ class GroupSendWorker(QThread):
     finished_all = Signal()
 
     def __init__(
-        self, members: list[tuple[str, str, str]], wire_body: str,
+        self, members: list[tuple[str, str, str, str]],
         my_private: bytes, my_public_b64: str, my_onion: str, socks_port: int,
     ) -> None:
-        """members: list of (contact_id, onion, public_key_b64) - resolved
-        by the caller before starting the thread, so this class never
-        touches the Vault itself (same "workers do network I/O, the UI
-        thread owns vault state" split every other worker here follows)."""
+        """members: list of (contact_id, onion, public_key_b64, wire_body)
+        - resolved by the caller before starting the thread, so this class
+        never touches the Vault itself (same "workers do network I/O, the
+        UI thread owns vault state" split every other worker here
+        follows). wire_body is per-member, not shared, because a
+        brand-new member's envelope carries their own individually-minted
+        invite code (see _start_group_send) - reusing one shared code
+        across multiple new members would let only the first of them
+        actually redeem it, exactly the single-use property this is
+        supposed to have."""
         super().__init__()
         self._members = members
-        self._wire_body = wire_body
         self._my_private = my_private
         self._my_public_b64 = my_public_b64
         self._my_onion = my_onion
         self._socks_port = socks_port
 
     def run(self) -> None:
-        for contact_id, onion, public_key_b64 in self._members:
+        for contact_id, onion, public_key_b64, wire_body in self._members:
             try:
                 transport.send_message(
                     onion=onion,
                     their_public_b64=public_key_b64,
-                    body=self._wire_body,
+                    body=wire_body,
                     my_private=self._my_private,
                     my_public_b64=self._my_public_b64,
                     my_onion=self._my_onion,
@@ -957,9 +986,32 @@ class ShareDialog(QDialog):
     silently modified without the signature failing to verify.
     """
 
-    def __init__(self, bundle_text: str, fingerprint: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        bundle_text: str,
+        fingerprint: str,
+        parent: QWidget | None = None,
+        *,
+        title: str | None = None,
+        secondary_label: str | None = None,
+        note_text: str | None = None,
+        copy_button_text: str | None = None,
+        copied_message: str | None = None,
+    ) -> None:
+        """
+        `fingerprint`/`secondary_label`: exactly one of these is shown as
+        the bold monospace line under the QR code - `fingerprint` for the
+        normal contact-share case, or `secondary_label` (e.g. an invite's
+        expiry time) for a caller sharing something else bundle-shaped
+        (see app.py's "Create invite" flow, which passes secondary_label
+        instead of a fingerprint - an invite has no fingerprint of its
+        own to show). `title`/`note_text`/`copy_button_text`/
+        `copied_message` default to the original contact-bundle wording
+        when omitted, so both existing call sites (Share Contact) need no
+        changes.
+        """
         super().__init__(parent)
-        self.setWindowTitle(self.tr("Share Contact"))
+        self.setWindowTitle(title or self.tr("Share Contact"))
         self.resize(420, 520)
         self.setSizeGripEnabled(True)
 
@@ -978,13 +1030,13 @@ class ShareDialog(QDialog):
         fp_font = QFont("monospace")
         fp_font.setBold(True)
         fp_font.setPointSize(12)
-        fp_label = QLabel(fingerprint)
+        fp_label = QLabel(secondary_label if secondary_label is not None else fingerprint)
         fp_label.setFont(fp_font)
         fp_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(fp_label)
 
         note = QLabel(
-            self.tr(
+            note_text if note_text is not None else self.tr(
                 "This bundle is signed, not encrypted: it proves it came from "
                 "this identity and cannot be modified without detection, but "
                 "anyone who has it can read what's inside - same as sharing an "
@@ -996,9 +1048,11 @@ class ShareDialog(QDialog):
         note.setObjectName("muted")
         layout.addWidget(note)
 
-        copy_button = QPushButton(self.tr("Copy bundle"))
+        copy_button = QPushButton(copy_button_text or self.tr("Copy bundle"))
         copy_button.setObjectName("primary")
-        copy_button.clicked.connect(lambda: self._copy_bundle(bundle_text))
+        copy_button.clicked.connect(
+            lambda: self._copy_bundle(bundle_text, copied_message)
+        )
         layout.addWidget(copy_button)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
@@ -1006,9 +1060,11 @@ class ShareDialog(QDialog):
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
 
-    def _copy_bundle(self, bundle_text: str) -> None:
+    def _copy_bundle(self, bundle_text: str, copied_message: str | None) -> None:
         QGuiApplication.clipboard().setText(bundle_text)
-        QMessageBox.information(self, self.tr("Copied"), self.tr("Contact bundle copied."))
+        QMessageBox.information(
+            self, self.tr("Copied"), copied_message or self.tr("Contact bundle copied.")
+        )
 
 
 class NewGroupDialog(QDialog):
@@ -1211,6 +1267,15 @@ class MainWindow(QMainWindow):
         # than a contact - at most one of _active_contact_id /
         # _active_group_id is set at a time (see _on_contact_selected).
         self._active_group_id: str | None = None
+        # Group ids this identity has received a KIND_GROUP_ACK for - see
+        # _wire_body_for, which keeps attaching this vault's invite code
+        # to every group send until the owning vault confirms real
+        # membership. In-memory only (not persisted): a restart just
+        # means a couple of harmless extra invcode-bearing sends before
+        # the next ack arrives, not a security issue - the owner's own
+        # redeem_group_invite_locally() is idempotent-safe either way
+        # (an already-used code is simply refused again, same result).
+        self._acked_group_ids: set[str] = set()
         self._group_send_worker: "GroupSendWorker | None" = None
         self._group_send_message_ids: dict[str, str] = {}
         self._send_worker: SendWorker | None = None
@@ -1391,6 +1456,13 @@ class MainWindow(QMainWindow):
         new_group_button = QPushButton(self.tr("New Group"))
         new_group_button.clicked.connect(self._on_new_group)
         row.addWidget(new_group_button)
+
+        join_group_button = QPushButton(self.tr("Join Group"))
+        join_group_button.setToolTip(
+            self.tr("Paste an invite someone sent you to join their group.")
+        )
+        join_group_button.clicked.connect(self._on_join_group)
+        row.addWidget(join_group_button)
 
         remove_button = QPushButton(self.tr("Remove"))
         remove_button.clicked.connect(self._on_remove_contact)
@@ -1604,7 +1676,14 @@ class MainWindow(QMainWindow):
             if contact.status == vault_mod.STATUS_BLOCKED:
                 continue  # blocked contacts stay hidden
 
-            count = len(contact.messages)
+            # Both counts below are scoped to this contact's own direct (non-
+            # group) messages only - contact.messages also holds this
+            # contact's copies of GROUP messages (see vault.group_messages()'s
+            # docstring), and folding those into the 1:1 row's "(N)"/"queued"
+            # counts would misreport group activity as DM activity, the same
+            # class of DM/group mixing bug fixed in _render_conversation.
+            direct_messages = [m for m in contact.messages if not m.group_id]
+            count = len(direct_messages)
             tooltip = ""
             if contact.status == vault_mod.STATUS_PENDING:
                 label = self.tr("[request] %(name)s") % {"name": contact.name}
@@ -1615,7 +1694,7 @@ class MainWindow(QMainWindow):
                 online = self.delivery.is_online(contact.id) if self.delivery else None
                 presence = "" if online is None else ("\u25cf " if online else "\u25cb ")
                 queued = sum(
-                    1 for m in contact.messages
+                    1 for m in direct_messages
                     if m.direction == "out" and m.status == vault_mod.QUEUED
                 )
                 suffix = self.tr("  (%(count)s)") % {"count": count} if count else ""
@@ -1783,10 +1862,131 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
-        self.vault.delete_group(group_id)
+        try:
+            self.vault.delete_group(group_id)
+        except ValueError as exc:
+            # Only reachable if the menu construction below somehow let a
+            # non-owner reach this action - vault.py's own check is the
+            # real boundary (defense-in-depth), this is just surfacing it.
+            QMessageBox.warning(self, self.tr("Could not delete group"), str(exc))
+            return
         if self._active_group_id == group_id:
             self._active_group_id = None
         self._reload_contacts()
+
+    def _on_leave_group(self, group_id: str) -> None:
+        group = self.vault.get_group(group_id)
+        if group is None:
+            return
+        confirm = QMessageBox.question(
+            self,
+            self.tr("Leave Group"),
+            i18n.fmt(
+                self.tr(
+                    "Leave the group “%(name)s”? The other members will be notified "
+                    "that you left."
+                ),
+                name=escape_html(group.name),
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self._send_group_control(group, envelope.encode_group_leave(group.id))
+        try:
+            self.vault.leave_group(group_id)
+        except ValueError as exc:
+            QMessageBox.warning(self, self.tr("Could not leave group"), str(exc))
+            return
+        if self._active_group_id == group_id:
+            self._active_group_id = None
+        self._reload_contacts()
+
+    def _send_group_control(self, group: vault_mod.Group, wire_body: str) -> None:
+        """
+        Fire-and-forget a control envelope (group_ack/group_leave) to
+        every CURRENT member this vault has for `group`, best-effort - a
+        member who is offline simply does not get it; unlike an ordinary
+        message this is not queued for retry (see envelope.py's
+        KIND_GROUP_ACK/KIND_GROUP_LEAVE docstrings: these are advisory
+        notices, not content, so a missed one is not something the
+        recipient is left waiting to receive - a leave, for instance, is
+        also implied the next time that member simply stops seeing new
+        group messages from this identity).
+        """
+        identity = self.vault.identity
+        if identity is None or self.tor.service is None:
+            return
+        for member_id in group.member_contact_ids:
+            member = self.vault.get_contact(member_id)
+            if member is None or member.status != vault_mod.STATUS_ACCEPTED:
+                continue
+            try:
+                transport.send_message(
+                    onion=member.onion,
+                    their_public_b64=member.public_key,
+                    body=wire_body,
+                    my_private=self.vault.private_key_raw(),
+                    my_public_b64=identity.public_key,
+                    my_onion=identity.onion,
+                    socks_port=self.tor.socks_port,
+                )
+            except transport.TransportError:
+                pass  # best-effort, see docstring above
+
+    def _on_create_group_invite(self, group: vault_mod.Group) -> None:
+        choices = [
+            (self.tr("1 hour"), 1),
+            (self.tr("24 hours"), 24),
+            (self.tr("7 days"), 24 * 7),
+        ]
+        labels = [label for label, _ in choices]
+        chosen_label, ok = QInputDialog.getItem(
+            self, self.tr("Create Invite"), self.tr("This invite expires after:"),
+            labels, 0, False,
+        )
+        if not ok:
+            return
+        expiry_hours = dict(choices)[chosen_label]
+
+        try:
+            invite_text = self.vault.create_group_invite(group.id, expiry_hours)
+        except (ValueError, vault_mod.VaultLocked) as exc:
+            QMessageBox.warning(self, self.tr("Could not create invite"), str(exc))
+            return
+
+        expires_label = i18n.fmt(
+            self.tr("Expires in %(hours)s hour(s)"), hours=expiry_hours,
+        )
+        ShareDialog(
+            invite_text, "", self,
+            title=self.tr("Group Invite"),
+            secondary_label=expires_label,
+            note_text=self.tr(
+                "This invite is signed and works only once, for this one group. "
+                "Send it only to the person you want to add - anyone who redeems "
+                "it before they do will use it up."
+            ),
+            copy_button_text=self.tr("Copy invite"),
+            copied_message=self.tr("Group invite copied."),
+        ).exec()
+
+    def _on_join_group(self) -> None:
+        text, ok = QInputDialog.getText(
+            self, self.tr("Join Group"),
+            self.tr("Paste the group invite (P2PGRP1:...) someone sent you:"),
+        )
+        if not ok or not text.strip():
+            return
+
+        try:
+            group = self.vault.join_group_from_invite(text.strip())
+        except (invite_mod.GroupInviteError, ValueError) as exc:
+            QMessageBox.warning(self, self.tr("Could not join group"), str(exc))
+            return
+
+        self._reload_contacts(select_id=group.id)
 
     def _on_new_group(self) -> None:
         accepted = self.vault.accepted_contacts()
@@ -1814,11 +2014,21 @@ class MainWindow(QMainWindow):
         group = self.vault.get_group(group_id)
         if group is None:
             return
+        is_owner = group.owner_contact_id == ""
 
         menu = QMenu(self)
         rename = menu.addAction(self.tr("Rename group"))
-        manage = menu.addAction(self.tr("Add/remove members"))
-        delete = menu.addAction(self.tr("Delete group"))
+        # Membership is now invite-gated and owner-authoritative (see
+        # vault.join_group_from_invite/redeem_group_invite_locally) - a
+        # non-owner's local add/remove would only diverge from what the
+        # real owner's vault thinks membership is, so both member
+        # management and invite creation are owner-only. A non-owner can
+        # still Rename their own local copy (cosmetic, local-only, same
+        # as it always was) and Leave.
+        manage = menu.addAction(self.tr("Add/remove members")) if is_owner else None
+        create_invite = menu.addAction(self.tr("Create invite...")) if is_owner else None
+        delete = menu.addAction(self.tr("Delete group")) if is_owner else None
+        leave = menu.addAction(self.tr("Leave group")) if not is_owner else None
         chosen = menu.exec(self.contact_list.mapToGlobal(position))
 
         if chosen == rename:
@@ -1828,10 +2038,14 @@ class MainWindow(QMainWindow):
             if ok and name.strip():
                 self.vault.rename_group(group.id, name)
                 self._reload_contacts(select_id=group.id)
-        elif chosen == manage:
+        elif manage is not None and chosen == manage:
             self._on_manage_group_members(group)
-        elif chosen == delete:
+        elif create_invite is not None and chosen == create_invite:
+            self._on_create_group_invite(group)
+        elif delete is not None and chosen == delete:
             self._on_delete_group(group.id)
+        elif leave is not None and chosen == leave:
+            self._on_leave_group(group.id)
 
     def _on_manage_group_members(self, group: vault_mod.Group) -> None:
         accepted = self.vault.accepted_contacts()
@@ -2105,9 +2319,19 @@ class MainWindow(QMainWindow):
         p = self.palette_colors
         # is_delete_request rows are the queued "delete for everyone"
         # notification itself (see vault.Vault.queue_delete_request()), not
-        # a displayed message - never rendered as a bubble.
+        # a displayed message - never rendered as a bubble. group_id rows
+        # are a copy of a GROUP message stored on this same contact's
+        # message list (see vault.Vault.group_messages()'s docstring - a
+        # group message is stored once per member, on that member's own
+        # Contact.messages, tagged with group_id) - without this filter a
+        # message sent/received inside a group conversation with this
+        # contact would also render in their private 1:1 DM thread, which
+        # would be a real privacy bug (mixing a group's contents into what
+        # looks like a private conversation). Only this contact's own
+        # direct (non-group) messages belong in this view; group messages
+        # belong exclusively in _render_group_conversation().
         ordered = sorted(
-            (m for m in contact.messages if not m.is_delete_request),
+            (m for m in contact.messages if not m.is_delete_request and not m.group_id),
             key=lambda m: m.timestamp,
         )
         for msg in ordered:
@@ -2269,6 +2493,24 @@ class MainWindow(QMainWindow):
                 self, self.tr("Could not save file"),
                 safe_error_text(exc, self.tr("Could not write the file to that location.")),
             )
+            return
+
+        # Never opened automatically - this is a deliberate second action
+        # by the user, after they already chose to save it (see
+        # _attachment_html's docstring on why nothing about an attachment
+        # is auto-rendered/auto-opened on receipt). QDesktopServices hands
+        # the file off to the OS's own registered default application for
+        # its type - this app never executes it directly or shells out to
+        # anything itself.
+        open_now = QMessageBox.question(
+            self, self.tr("Saved"),
+            i18n.fmt(
+                self.tr("Saved to:\n%(path)s\n\nOpen it now?"), path=target_path,
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if open_now == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target_path))
 
     def _on_delete_message(self, msg: vault_mod.Message) -> None:
         """
@@ -2520,6 +2762,17 @@ class MainWindow(QMainWindow):
         hardened retry sweep picks up any member this attempt fails for,
         with zero changes to that code - see _wire_body_for), then starts
         one GroupSendWorker to actually attempt delivery to everyone.
+
+        Members in group.pending_onboard_contact_ids (added directly via
+        create_group()/the "Add/remove members" UI, never through an
+        invite) get their OWN individually-minted, single-use invite
+        embedded in their copy of this message instead of the plain
+        shared envelope everyone else gets - see
+        Group.pending_onboard_contact_ids's docstring for why this is the
+        only way they can ever learn the group exists at all. Each
+        onboarding member's invite is distinct (never the same code
+        reused across members - group_invite.py's whole single-use
+        property depends on that).
         """
         identity = self.vault.identity
         assert identity is not None
@@ -2535,26 +2788,70 @@ class MainWindow(QMainWindow):
 
         client_msg_id = str(uuid.uuid4())
 
-        # Build the wire envelope first (it sanitizes the filename - see
+        # See _wire_body_for's docstring on acked_group_ids: keep proving
+        # invitation on every send to a group this vault joined via
+        # invite until the owner's KIND_GROUP_ACK confirms membership.
+        # Never set for a group this vault owns.
+        shared_invcode = (
+            group.joined_invite_code
+            if group.joined_invite_code and group.id not in self._acked_group_ids
+            else ""
+        )
+
+        def build_body(invcode: str) -> str:
+            if is_file:
+                return envelope.encode_file(
+                    os.path.basename(file_path), file_mime, file_data,
+                    gid=group.id, gname=group.name, mid=client_msg_id, invcode=invcode,
+                )
+            return envelope.encode_text(
+                text_body, gid=group.id, gname=group.name, mid=client_msg_id, invcode=invcode,
+            )
+
+        # Build the shared envelope first (it sanitizes the filename - see
         # envelope.py), then decode it straight back so the locally-stored
         # Message rows use the exact same sanitized filename/mime that will
         # actually go out on the wire, rather than re-deriving them
-        # separately and risking the two falling out of sync.
+        # separately and risking the two falling out of sync. Onboarding
+        # members' individually-invite-bearing bodies below re-derive
+        # from the SAME sanitized filename/mime (via the decoded `sent`
+        # values), not by re-sanitizing the raw path a second time, so
+        # the stored Message row is identical either way.
+        shared_wire_body = build_body(shared_invcode)
+        sent = envelope.decode(shared_wire_body)
         if is_file:
-            wire_body = envelope.encode_file(
-                os.path.basename(file_path), file_mime, file_data,
-                gid=group.id, gname=group.name, mid=client_msg_id,
-            )
-            sent = envelope.decode(wire_body)
             stored_body = sent.body  # already base64, matches envelope's own encoding
             attachment_filename, attachment_mime, attachment_size = sent.filename, sent.mime, sent.size
         else:
-            wire_body = envelope.encode_text(
-                text_body, gid=group.id, gname=group.name, mid=client_msg_id
-            )
             stored_body = text_body
             attachment_filename = attachment_mime = ""
             attachment_size = 0
+
+        onboarding_ids = set(group.pending_onboard_contact_ids)
+        per_member_bodies: dict[str, str] = {}
+        per_member_invcodes: dict[str, str] = {}
+        for member_id in onboarding_ids:
+            if member_id not in {m[0] for m in members}:
+                continue
+            try:
+                personal_invite = self.vault.create_group_invite(
+                    group.id, vault_mod.INVITE_EXPIRY_CHOICES_HOURS[-1],
+                )
+            except (ValueError, vault_mod.VaultLocked):
+                continue  # not the owner, or identity not ready - falls back to the shared body
+            personal_code = invite_mod.parse_invite(personal_invite).code
+            per_member_bodies[member_id] = (
+                envelope.encode_file(
+                    os.path.basename(file_path), file_mime, file_data,
+                    gid=group.id, gname=group.name, mid=client_msg_id, invcode=personal_code,
+                ) if is_file else
+                envelope.encode_text(
+                    text_body, gid=group.id, gname=group.name,
+                    mid=client_msg_id, invcode=personal_code,
+                )
+            )
+            per_member_invcodes[member_id] = personal_code
+            self.vault.clear_group_onboarding(group.id, member_id)
 
         message_ids: dict[str, str] = {}
         for member_id, _onion, _pub in members:
@@ -2563,6 +2860,7 @@ class MainWindow(QMainWindow):
                 status=vault_mod.QUEUED, group_id=group.id, client_msg_id=client_msg_id,
                 attachment_filename=attachment_filename, attachment_mime=attachment_mime,
                 attachment_size=attachment_size,
+                pending_invcode=per_member_invcodes.get(member_id, ""),
             )
             if msg is not None:
                 message_ids[member_id] = msg.id
@@ -2575,9 +2873,12 @@ class MainWindow(QMainWindow):
 
         self.send_button.setDisabled(True)
         self.attach_button.setDisabled(True)
+        worker_members = [
+            (member_id, onion, pub, per_member_bodies.get(member_id, shared_wire_body))
+            for member_id, onion, pub in members
+        ]
         self._group_send_worker = GroupSendWorker(
-            members=members,
-            wire_body=wire_body,
+            members=worker_members,
             my_private=self.vault.private_key_raw(),
             my_public_b64=identity.public_key,
             my_onion=identity.onion,
@@ -2875,8 +3176,29 @@ class MainWindow(QMainWindow):
                 self._render_conversation(self.vault.get_contact(contact.id))
             return
 
+        if env.kind == envelope.KIND_GROUP_ACK:
+            # Confirms this contact's vault just accepted us as a real
+            # member of env.gid (see vault.redeem_group_invite_locally on
+            # their side) - nothing to store, just stop attaching invcode
+            # to future sends for this group (see _wire_body_for).
+            group = self.vault.get_group(env.gid)
+            if group is not None:
+                self._acked_group_ids.add(group.id)
+            return
+
+        if env.kind == envelope.KIND_GROUP_LEAVE:
+            group = self.vault.get_group(env.gid)
+            if group is not None and contact.id in group.member_contact_ids:
+                self.vault.remove_group_member(group.id, contact.id)
+                self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+                if self._active_group_id == group.id:
+                    self._render_conversation(None, group=group)
+            return
+
         if env.gid:
             group = self._file_incoming_group_message(contact, env)
+            if group is None:
+                return  # Unrecognized group (never created/joined here) - dropped.
         else:
             group = None
             if env.kind == envelope.KIND_FILE:
@@ -2940,22 +3262,83 @@ class MainWindow(QMainWindow):
 
     def _file_incoming_group_message(
         self, sender: vault_mod.Contact, env: envelope.Envelope,
-    ) -> vault_mod.Group:
-        """Store an incoming group-tagged message, auto-creating (or
-        growing the membership of) the local Group it belongs to. See
-        vault.Vault.create_group_from_invite for why this is safe to do
-        automatically: it only ever adds an already-accepted contact you
-        chose to trust, never a stranger."""
+    ) -> vault_mod.Group | None:
+        """
+        Store an incoming group-tagged message, if this vault is willing
+        to recognize the group at all.
+
+        Unlike the old "any accepted contact who sends a gid auto-starts
+        a group" behavior, a group can now only ever be created locally
+        by two paths: create_group() (the local user's own action) or
+        join_group_from_invite() (an explicit, signed, single-use,
+        time-limited invite - see vault.py and group_invite.py). This
+        method NEVER creates a Group - only vault.Group() construction
+        via those two entry points does. A gid this vault has no local
+        Group for at all is simply unrecognized and the message is
+        dropped (returns None) - there is no invite-less path into a
+        group conversation any more.
+
+        Two different membership-growth rules depending on which side of
+        ownership this vault is on:
+
+        * This vault OWNS the group (owner_contact_id == ""): a sender
+          not yet a member is only added if their message carries a
+          currently valid (unused, unexpired) invcode - checked via
+          redeem_group_invite_locally(), the actual single-use
+          enforcement point. A valid redemption also sends KIND_GROUP_ACK
+          back so the new member's UI can stop attaching invcode to
+          future sends. An invalid/missing code means the message is
+          still filed (so the sender can see it was "sent", consistent
+          with the existing over-capacity fallback) but membership is
+          refused.
+        * This vault does NOT own the group (joined via invite itself):
+          it has no authority to redeem anyone's invite - only the real
+          owner's vault can. A never-seen sender is added as a member
+          here only if they are already one of this vault's own accepted
+          contacts (the same "you must already trust this identity"
+          boundary used everywhere else in this app - see
+          Identity.accept_from_anyone's docstring) - this is what lets
+          messages from fellow members you already know arrive normally
+          without needing to re-verify an invite you were never issued.
+          A stranger (not an accepted contact) sending a message tagged
+          with this gid is not added as a member, though - like the
+          owner-side invalid-code case - their message is still filed.
+
+        Deliberately does NOT auto-re-add a sender in
+        group.removed_contact_ids (a removed/left member) under either
+        rule above - see that field's docstring.
+        """
         group = self.vault.get_group(env.gid)
         if group is None:
-            group = self.vault.create_group_from_invite(
-                env.gid, env.gname or self.tr("Group"), sender.id,
-            )
-        elif sender.id not in group.member_contact_ids:
-            try:
-                self.vault.add_group_member(group.id, sender.id)
-            except ValueError:
-                pass  # group is already at MAX_GROUP_MEMBERS; message is still filed below
+            return None
+
+        is_owner = group.owner_contact_id == ""
+        already_member = sender.id in group.member_contact_ids
+        removed = sender.id in group.removed_contact_ids
+
+        if not already_member and not removed:
+            if is_owner:
+                if env.invcode and self.vault.redeem_group_invite_locally(group.id, env.invcode):
+                    try:
+                        # needs_onboarding=False: this sender already has
+                        # their own local Group record (created via
+                        # join_group_from_invite on their side when they
+                        # redeemed this same code) - they do not need a
+                        # second, redundant auto-invite from us.
+                        self.vault.add_group_member(group.id, sender.id, needs_onboarding=False)
+                        self.vault.mark_group_invite_used(group.id, env.invcode, sender.id)
+                        self._send_group_control(group, envelope.encode_group_ack(group.id))
+                    except ValueError:
+                        pass  # MAX_GROUP_MEMBERS reached; message still filed below
+            else:
+                try:
+                    # needs_onboarding=False: this vault is not the
+                    # group's owner and cannot issue invites for it at
+                    # all (see create_group_invite's owner-only check) -
+                    # pending_onboard_contact_ids is meaningless here.
+                    self.vault.add_group_member(group.id, sender.id, needs_onboarding=False)
+                except ValueError:
+                    pass  # not an accepted contact, or MAX_GROUP_MEMBERS reached
 
         if env.kind == envelope.KIND_FILE:
             self.vault.add_message(
@@ -3256,12 +3639,22 @@ def _attachment_html(msg, p) -> str:
     HTML for a file/image attachment carried on a message (see
     Message.attachment_filename in vault.py and envelope.py's KIND_FILE).
 
-    Images get an inline preview decoded straight from the base64 already
-    held in msg.body (no extra decode step elsewhere); anything else gets a
-    generic file glyph. Either way a "Save As..." link is included - an
-    anchor with a stable `attach:<message id>` href that
-    MainWindow._on_thread_link_clicked resolves back to the real Message to
-    write out, rather than embedding the bytes in the href itself.
+    Deliberately NEVER renders an inline <img> preview, for an image or
+    anything else - every attachment, image included, shows only a
+    filename/size and a "Save As..." link, exactly like a generic file.
+    The user has to explicitly choose to save (and then open) it before
+    ever seeing its actual content, the same "download before you view
+    it" model Telegram/Signal-style messengers use rather than
+    auto-decoding and displaying arbitrary contact-supplied bytes the
+    moment a message arrives. This is also a real, not just cosmetic,
+    security narrowing: Qt's rich-text renderer is not a hardened image
+    decoder, and an attacker-controlled image is exactly the kind of
+    input a decoder vulnerability would be triggered by - not
+    auto-decoding it removes that from the "happens automatically on
+    receipt" path entirely, moving it behind a deliberate user action.
+    The "Save As..." href is a stable `attach:<message id>` anchor that
+    MainWindow._on_thread_link_clicked resolves back to the real Message
+    to write out, rather than embedding the bytes in the href itself.
     """
     if not getattr(msg, "attachment_filename", ""):
         return ""
@@ -3284,19 +3677,9 @@ def _attachment_html(msg, p) -> str:
         f"style='color:{p.accent};text-decoration:none;'>{save_as_text}</a>"
     )
 
-    preview = ""
-    mime = getattr(msg, "attachment_mime", "")
-    if mime.startswith("image/"):
-        preview = (
-            f"<div style='margin-bottom:4px;'>"
-            f"<img src='data:{escape_html(mime)};base64,{msg.body}' "
-            f"width='220' style='border-radius:6px;'></div>"
-        )
-
     return (
         f"<div style='margin-top:4px;padding:6px;border:1px solid {p.border};"
         f"border-radius:6px;'>"
-        f"{preview}"
         f"<div style='color:{p.text};font-size:12px;'>\U0001F4CE {filename}</div>"
         f"<div style='color:{p.text_muted};font-size:11px;'>{size_text} &middot; {save_link}</div>"
         f"</div>"

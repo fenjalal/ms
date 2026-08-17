@@ -26,12 +26,13 @@ import shutil
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from nacl.signing import SigningKey
 
 import bundle as bundle_mod
 import crypto
+import group_invite as invite_mod
 import paths
 
 _logger = logging.getLogger("veilwire")
@@ -132,6 +133,22 @@ class Message:
     # is the id of the message being deleted (not its own), and its body is
     # always empty. See queue_delete_request() below.
     is_delete_request: bool = False
+    # pending_invcode: set only on an OUTGOING group message's per-member
+    # copy (direction "out", group_id non-empty) when this particular
+    # member was directly added (create_group()/"Add/remove members", not
+    # invite-redeemed - see Group.pending_onboard_contact_ids) and this
+    # copy is the one embedding their individually-minted, single-use
+    # invite code. app.py's _wire_body_for reads this back on every
+    # retry so a queued/failed onboarding send keeps proving invitation
+    # with the SAME code rather than losing it (falling back to the
+    # plain shared envelope, which the recipient's client would then
+    # have no local Group record to accept at all) or minting a fresh
+    # one on every retry (which would silently invalidate the previous
+    # code with each attempt via create_group_invite's unlimited
+    # issuance, wasting invite records for no reason). Empty for every
+    # other message - an ordinary group send, a 1:1 send, an incoming
+    # message, all leave this "".
+    pending_invcode: str = ""
 
 
 # A contact is in exactly one of these states.
@@ -193,6 +210,24 @@ MAX_GROUP_NAME_LENGTH = 100
 # taking arbitrarily long.
 MAX_GROUP_MEMBERS = 50
 
+# How long a freshly created invite remains redeemable, in hours - offered
+# as a small fixed set of choices in the UI (see app.py), not a free-form
+# value, so an "expiry" is always one of a few well-understood windows.
+INVITE_EXPIRY_CHOICES_HOURS = (1, 24, 24 * 7)
+
+# Ceiling on how many attachment bytes (base64-encoded, i.e. what is
+# actually stored in Message.body) a single contact's INCOMING messages may
+# accumulate across the whole message history. envelope.MAX_FILE_BYTES
+# already bounds any one file, but nothing previously bounded the *count* -
+# an accepted-but-hostile contact could otherwise send an unbounded stream
+# of maximum-size files and slowly fill the user's disk via vault.dat's
+# growth (each one re-encrypting and rewriting the entire vault on save,
+# too). 500 MiB is generous for legitimate use (dozens of photos/documents
+# from one contact) while still being a real ceiling. Only applied to
+# incoming attachments (direction == "in") - the user's own outgoing sends
+# are never refused by their own vault.
+MAX_ATTACHMENT_BYTES_PER_CONTACT = 500 * 1024 * 1024
+
 
 @dataclass
 class Group:
@@ -217,6 +252,95 @@ class Group:
     name: str
     created: str
     member_contact_ids: list[str] = field(default_factory=list)
+    # Contacts explicitly removed via remove_group_member(), as opposed to
+    # a contact who simply never joined. An incoming group-tagged message
+    # from a sender not currently in member_contact_ids is normally
+    # auto-added (see app.py's _file_incoming_group_message - that's what
+    # lets a group show up at all with no server to coordinate an invite
+    # flow). Without this set, that auto-add logic cannot tell "never
+    # joined" apart from "the user removed them on purpose", so a removed
+    # member could silently rejoin just by sending one more group message.
+    # Checked before auto-adding; NOT cleared by add_group_member(), since
+    # only a deliberate action (re-adding via the group's member-management
+    # UI, which calls remove-from-removed explicitly) should undo a removal.
+    removed_contact_ids: list[str] = field(default_factory=list)
+    # Empty string means "this vault's own identity owns this group" (it
+    # was created locally via create_group()) - there is no separate id
+    # for "myself" the way a Contact has one, so empty-string is the
+    # existing "no id needed, it's me" convention already used elsewhere
+    # in this file. A non-empty value is the contact id of whoever's
+    # signed invite this vault joined the group through (see
+    # join_group_from_invite) - that contact is the only one whose
+    # "delete group" is honored as deleting the group for real; everyone
+    # else can only leave (see app.py's owner-conditional Delete/Leave
+    # menu and Vault.delete_group's is_owner check below).
+    owner_contact_id: str = ""
+    # Invites THIS vault has issued for this group - only meaningful when
+    # owner_contact_id == "" (only a group's owner can issue invites for
+    # it, see create_group_invite). See GroupInviteRecord's docstring for
+    # what "used" actually means given there is no server to enforce it.
+    issued_invites: list["GroupInviteRecord"] = field(default_factory=list)
+    # The invite code THIS vault redeemed to join, when owner_contact_id
+    # != "" (empty/unused when this vault owns the group - an owner never
+    # redeems anyone's invite for their own group). app.py's send path
+    # (_wire_body_for) attaches this to every outgoing group message
+    # until the owner's KIND_GROUP_ACK confirms real membership - see
+    # MainWindow._acked_group_ids - since the owner's vault is the only
+    # place able to validate it (redeem_group_invite_locally), a message
+    # sent before that ack arrives still needs to carry proof of
+    # invitation on every attempt, the same way any other queued/retried
+    # message here already carries its full context on every retry
+    # (see _wire_body_for's own docstring on why retries aren't
+    # abbreviated).
+    joined_invite_code: str = ""
+    # Members added directly (create_group()'s initial list, or
+    # add_group_member() from the "Add/remove members" UI) who have not
+    # yet been sent an auto-generated personal invite. Only meaningful
+    # when owner_contact_id == "" (a non-owner never adds members
+    # directly - see app.py's owner-only "Add/remove members" menu gate).
+    #
+    # A directly-added member has no way to learn the group exists at
+    # all otherwise: unlike an invite-redeeming joiner, they never ran
+    # join_group_from_invite(), so their own vault has no local Group
+    # record whatsoever, and app.py's _file_incoming_group_message()
+    # drops any message for a gid it does not already recognize (that is
+    # the whole point of removing the old auto-join-on-any-message
+    # behavior). So the OWNER'S next send to a member in this set embeds
+    # a freshly minted, single-use, real invite (see
+    # app.py._start_group_send) instead of the plain shared envelope -
+    # the member's client redeems it exactly like a pasted invite would,
+    # just delivered automatically instead of requiring a manual paste.
+    # Removed from this set the moment that onboarding send is attempted
+    # (success or failure - a failed send is retried by the normal
+    # queued-message path using the SAME already-embedded invite code
+    # stored on that specific queued Message, not a fresh one each time,
+    # so a retry cannot mint and burn multiple codes for one member).
+    pending_onboard_contact_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GroupInviteRecord:
+    """
+    One invite this vault's own identity issued for a group it owns,
+    tracked so a second redemption attempt of the same code can be
+    refused.
+
+    This is the actual single-use enforcement point for group invites -
+    see group_invite.py's module docstring for why it has to live here
+    (on the owner's own vault) rather than in the invite text itself:
+    there is no server to ask "has this code been used by someone else
+    already," so the owner's own record of what it has already redeemed
+    is the only authority that exists. `used` is checked and set by
+    Vault.redeem_group_invite_locally(), the moment the owner sees a
+    group-tagged message carrying this code from a sender who is not yet
+    a member.
+    """
+
+    code: str
+    created: str
+    expires: str  # ISO-8601 UTC timestamp
+    used: bool = False
+    used_by_contact_id: str = ""  # set alongside `used`, for the UI's own record
 
 
 @dataclass
@@ -621,6 +745,10 @@ class Vault:
                 name=_clean_group_name(name) or "Group",
                 created=_now(),
                 member_contact_ids=deduped,
+                # Every initial member needs an auto-generated invite
+                # embedded in the owner's first send to them - see
+                # pending_onboard_contact_ids's docstring.
+                pending_onboard_contact_ids=list(deduped),
             )
             self.groups.append(group)
             self.save()
@@ -689,12 +817,27 @@ class Vault:
                 group.name = _clean_group_name(name) or group.name
                 self.save()
 
-    def add_group_member(self, group_id: str, contact_id: str) -> None:
+    def add_group_member(self, group_id: str, contact_id: str, *, needs_onboarding: bool = True) -> None:
         """Add an already-accepted contact to a group. A member added this
         way only sees *future* messages sent while they are a member -
         there is no history to backfill from, since past messages were
         never sent to them (see Group's docstring on there being no shared
-        roster)."""
+        roster).
+
+        This is also how a previously-removed member gets to rejoin - the
+        one deliberate path that's allowed to clear removed_contact_ids
+        (see that field's docstring).
+
+        `needs_onboarding` controls whether this contact is queued for an
+        auto-generated personal invite (see
+        Group.pending_onboard_contact_ids). True (the default) for the
+        owner's own "add member" UI action - a directly-added member has
+        no other way to learn the group exists. False when called from
+        app.py's _file_incoming_group_message right after that same
+        contact's invite code was validated by
+        redeem_group_invite_locally() - they already have a local Group
+        record (created via join_group_from_invite on their own side) and
+        do not need a second, redundant invite."""
         with self._lock:
             group = self.get_group(group_id)
             if group is None:
@@ -702,60 +845,235 @@ class Vault:
             contact = self.get_contact(contact_id)
             if contact is None or contact.status != STATUS_ACCEPTED:
                 raise ValueError("Only an existing, accepted contact can be added to a group.")
+            if contact_id in group.removed_contact_ids:
+                group.removed_contact_ids.remove(contact_id)
             if contact_id in group.member_contact_ids:
+                self.save()
                 return
             if len(group.member_contact_ids) >= MAX_GROUP_MEMBERS:
                 raise ValueError(f"A group can have at most {MAX_GROUP_MEMBERS} members.")
             group.member_contact_ids.append(contact_id)
+            if needs_onboarding and contact_id not in group.pending_onboard_contact_ids:
+                group.pending_onboard_contact_ids.append(contact_id)
             self.save()
 
-    def remove_group_member(self, group_id: str, contact_id: str) -> None:
+    def clear_group_onboarding(self, group_id: str, contact_id: str) -> None:
+        """
+        Marks a directly-added member as having received their
+        auto-generated personal invite (see
+        Group.pending_onboard_contact_ids and app.py's
+        _start_group_send). Called once that member's individually-built,
+        invite-bearing envelope has actually been queued for sending -
+        not once it is confirmed delivered, since a failed/queued send is
+        retried with the SAME already-embedded code (see
+        _wire_body_for/DeliveryWorker), not a freshly minted one, so
+        there is nothing further for this method to do on a later retry.
+        """
         with self._lock:
             group = self.get_group(group_id)
-            if group is not None and contact_id in group.member_contact_ids:
-                group.member_contact_ids.remove(contact_id)
+            if group is None:
+                return
+            if contact_id in group.pending_onboard_contact_ids:
+                group.pending_onboard_contact_ids.remove(contact_id)
                 self.save()
 
-    def delete_group(self, group_id: str) -> None:
-        """Forget the group. Past messages are left in place on each
-        member's own contact record (still tagged with the now-orphaned
-        group_id) rather than deleted, matching how removing a contact
-        does not retroactively scrub messages already exchanged."""
+    def remove_group_member(self, group_id: str, contact_id: str) -> None:
+        """Remove a member and record the removal so an incoming group
+        message from them does not silently re-add them (see
+        Group.removed_contact_ids) - the only way back in is the user
+        explicitly re-adding them via add_group_member()."""
         with self._lock:
+            group = self.get_group(group_id)
+            if group is None:
+                return
+            if contact_id in group.member_contact_ids:
+                group.member_contact_ids.remove(contact_id)
+            if contact_id not in group.removed_contact_ids:
+                group.removed_contact_ids.append(contact_id)
+            self.save()
+
+    def delete_group(self, group_id: str) -> None:
+        """
+        Forget the group. Past messages are left in place on each member's
+        own contact record (still tagged with the now-orphaned group_id)
+        rather than deleted, matching how removing a contact does not
+        retroactively scrub messages already exchanged.
+
+        Raises ValueError if this vault is not the group's owner
+        (Group.owner_contact_id != "") - a non-owner member is only ever
+        allowed to leave (see app.py's Leave-group flow, which sends a
+        KIND_GROUP_LEAVE notice to the other members and THEN calls this
+        method to remove its own local copy). The check lives here, not
+        only in app.py's menu construction, so it holds even if a future
+        call site forgets to check first - same defense-in-depth stance
+        create_group()'s own validation already takes.
+        """
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is None:
+                return
+            if group.owner_contact_id != "":
+                raise ValueError("Only the group's owner can delete it - you can leave instead.")
             self.groups = [g for g in self.groups if g.id != group_id]
             self.save()
 
-    def create_group_from_invite(self, group_id: str, name: str, first_member_id: str) -> Group:
+    def leave_group(self, group_id: str) -> None:
         """
-        Auto-create a local Group the first time an incoming message arrives
-        tagged with a group id (envelope.py's "gid") this vault does not
-        already have. Since group membership is entirely local (see Group's
-        docstring - there is no server-side roster), a group-tagged message
-        from a contact you have not filed under any local group yet is,
-        practically, that contact including you in a group they set up on
-        their side; this is what lets it show up as a group conversation on
-        yours too instead of silently being dropped.
+        Remove this vault's own local copy of a group it does NOT own -
+        the non-owner counterpart to delete_group(). Callers (app.py) are
+        expected to have already notified the other members (see
+        KIND_GROUP_LEAVE) before calling this - this method only ever
+        touches local state, same as delete_group().
 
-        Unlike create_group(), the new Group's id is the SENDER's own gid
-        rather than a freshly generated one, so a later message tagged with
-        the same gid - from this sender, or from another member once this
-        one gets added via add_group_member - is recognized as the same
-        group instead of each starting a separate one. If a group with this
-        id already exists, it is returned unchanged (idempotent - a caller
-        does not need to check existence first).
+        Raises ValueError if this vault IS the group's owner - an owner
+        leaving would strand every other member with no one able to issue
+        new invites or authoritatively delete the group; the owner's only
+        way to end a group for themselves is delete_group().
         """
         with self._lock:
-            existing = self.get_group(group_id)
+            group = self.get_group(group_id)
+            if group is None:
+                return
+            if group.owner_contact_id == "":
+                raise ValueError("The group's owner cannot leave - delete the group instead.")
+            self.groups = [g for g in self.groups if g.id != group_id]
+            self.save()
+
+    def create_group_invite(self, group_id: str, expiry_hours: int) -> str:
+        """
+        Issue a fresh, signed, single-use invite for a group this vault
+        owns (see group_invite.py). Raises ValueError if this vault does
+        not own the group (only an owner can invite - a non-owner member
+        minting invites for someone else's group would let them grant
+        membership on the owner's behalf with no owner involvement at
+        all) or if the identity has no signing key yet (should not
+        happen post-unlock - see Identity.signing_private_key's
+        docstring - but checked rather than assumed).
+        """
+        with self._lock:
+            if self.identity is None:
+                raise VaultLocked("Cannot create an invite on a locked vault.")
+            group = self.get_group(group_id)
+            if group is None:
+                raise ValueError("No such group.")
+            if group.owner_contact_id != "":
+                raise ValueError("Only the group's owner can create invites for it.")
+            if not self.identity.onion or not self.identity.signing_private_key:
+                raise ValueError("Cannot create an invite before your identity is fully set up.")
+
+            code = invite_mod.new_invite_code()
+            created = _now()
+            expires = (
+                datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
+            ).isoformat(timespec="seconds")
+
+            invite_text = invite_mod.build_invite(
+                group.id, group.name, code, expires,
+                self.identity.onion, self.identity.public_key,
+                self.identity.signing_public_key, self.identity.signing_private_key,
+            )
+            group.issued_invites.append(
+                GroupInviteRecord(code=code, created=created, expires=expires)
+            )
+            self.save()
+            return invite_text
+
+    def redeem_group_invite_locally(self, group_id: str, code: str) -> bool:
+        """
+        Called on the group OWNER's side when a group-tagged message
+        arrives from a sender who is not yet a member, carrying an
+        invite code (envelope.py's "invcode"). Returns True (and marks
+        the record used) only for a code that is real, unexpired, and not
+        already used - the actual single-use/expiry enforcement point,
+        see GroupInviteRecord's docstring for why this has to be the
+        owner's own record and cannot be enforced any other way without a
+        server.
+        """
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is None or group.owner_contact_id != "":
+                return False
+            for record in group.issued_invites:
+                if record.code != code:
+                    continue
+                if record.used:
+                    return False
+                if record.expires <= _now():
+                    return False
+                return True
+            return False
+
+    def mark_group_invite_used(self, group_id: str, code: str, used_by_contact_id: str) -> None:
+        """
+        Marks an invite code consumed. Split from
+        redeem_group_invite_locally() (which only checks validity,
+        read-only) so the caller (app.py) can decide whether to actually
+        add the sender as a member (e.g. it might still fail on
+        MAX_GROUP_MEMBERS) before committing the code as spent - a code
+        that turned out unusable for an unrelated reason should not be
+        burned for nothing.
+        """
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is None:
+                return
+            for record in group.issued_invites:
+                if record.code == code and not record.used:
+                    record.used = True
+                    record.used_by_contact_id = used_by_contact_id
+                    self.save()
+                    return
+
+    def join_group_from_invite(self, invite_text: str) -> Group:
+        """
+        Parse and verify a signed group invite (group_invite.py), then
+        create (or return the existing) local Group record for it, owned
+        by the inviting contact.
+
+        Raises group_invite.GroupInviteError for a malformed/tampered/
+        forged invite (never a partially-trusted result - see that
+        module's docstring), ValueError if the invite has already expired
+        (checked here, locally, against this machine's clock - the
+        "time-limited" half of the feature) or if the signed owner
+        identity is not already an accepted contact of this vault.
+
+        That last check is deliberate: an invite's signed payload proves
+        WHO issued it, but this app never auto-trusts a new identity just
+        because it showed up in a signed document (see bundle.py's own
+        contact-request flow, which always requires an explicit
+        accept/block decision) - joining a group is not an exception to
+        that. If the owner is not yet a contact, the user is expected to
+        add/accept them the normal way first, then redeem the invite.
+
+        Joining here does NOT itself grant membership on the owner's
+        side - it only creates this vault's own local copy of the group.
+        Real membership is only established once the owner's vault sees
+        a message from this identity carrying the invite's code and
+        calls redeem_group_invite_locally() - see app.py's send path,
+        which keeps attaching the code to outgoing group messages until
+        the owner's KIND_GROUP_ACK confirms membership.
+        """
+        with self._lock:
+            invite = invite_mod.parse_invite(invite_text)
+            if invite.expires <= _now():
+                raise ValueError("This invite has expired.")
+
+            owner = self.find_by_public_key(invite.owner_public_key)
+            if owner is None or owner.status != STATUS_ACCEPTED:
+                raise ValueError(
+                    "Add and accept this invite's sender as a contact before joining their group."
+                )
+
+            existing = self.get_group(invite.gid)
             if existing is not None:
                 return existing
-            member = self.get_contact(first_member_id)
-            if member is None or member.status != STATUS_ACCEPTED:
-                raise ValueError("Only an existing, accepted contact can start a group.")
+
             group = Group(
-                id=group_id,
-                name=_clean_group_name(name) or "Group",
+                id=invite.gid,
+                name=_clean_group_name(invite.gname) or "Group",
                 created=_now(),
-                member_contact_ids=[first_member_id],
+                owner_contact_id=owner.id,
+                joined_invite_code=invite.code,
             )
             self.groups.append(group)
             self.save()
@@ -777,11 +1095,35 @@ class Vault:
         attachment_mime: str = "",
         attachment_size: int = 0,
         is_delete_request: bool = False,
+        pending_invcode: str = "",
     ) -> Message | None:
         with self._lock:
             contact = self.get_contact(contact_id)
             if contact is None:
                 return None
+
+            # Only bounds INCOMING attachments - see
+            # MAX_ATTACHMENT_BYTES_PER_CONTACT's docstring. attachment_size
+            # is the real decoded byte count (envelope.decode() always
+            # recomputes it from the actual bytes, never trusting a
+            # sender's claimed field), so this cannot be defeated by lying
+            # about size in the envelope.
+            if direction == "in" and attachment_filename and attachment_size > 0:
+                existing = sum(
+                    m.attachment_size for m in contact.messages
+                    if m.direction == "in" and m.attachment_filename and not m.deleted
+                )
+                if existing + attachment_size > MAX_ATTACHMENT_BYTES_PER_CONTACT:
+                    # Logged without the filename/contact name (both are
+                    # peer-controlled/potentially sensitive display text) -
+                    # just enough to explain, after the fact, why a file
+                    # silently never appeared for a given contact.
+                    _logger.warning(
+                        "Dropped an incoming attachment: contact %s would exceed "
+                        "the %d-byte per-contact attachment cap",
+                        contact_id, MAX_ATTACHMENT_BYTES_PER_CONTACT,
+                    )
+                    return None
 
             message = Message(
                 id=str(uuid.uuid4()),
@@ -799,6 +1141,7 @@ class Vault:
                 attachment_mime=attachment_mime,
                 attachment_size=attachment_size,
                 is_delete_request=is_delete_request,
+                pending_invcode=pending_invcode,
             )
             contact.messages.append(message)
             self.save()

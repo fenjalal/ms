@@ -1,21 +1,25 @@
 """
-End-to-end test for the group-chat and file-transfer features: three
-independent identities exchange group and file messages through the full
-stack (vault -> envelope -> crypto -> transport -> vault), the same way
-test_e2e.py exercises plain 1:1 messaging.
+End-to-end test for the group-chat, invite, and file-transfer features:
+three independent identities exchange group and file messages through the
+full stack (vault -> envelope -> crypto -> transport -> vault), the same
+way test_e2e.py exercises plain 1:1 messaging.
 
 Tor is replaced by a direct localhost connection (no Tor daemon in this
 sandbox), exactly as test_e2e.py does. Everything above the transport -
-vault.Group/Message, envelope.py, contact/group resolution - is the real
-production code path; only the socket target changes.
+vault.Group/Message, group_invite.py, envelope.py, contact/group
+resolution - is the real production code path; only the socket target
+changes.
 
 This does not exercise app.py's Qt widgets (GroupSendWorker, the sidebar,
 render_bubble's group-aggregate note) - those need a running QApplication
 and are covered indirectly by test_ui.py's render_bubble checks. What this
 test proves is that the wire-level contract app.py relies on actually
-round-trips correctly: a group-tagged envelope sent to N members is
-individually decryptable by each, auto-files into a local Group on the
-receiving side, and a file envelope's bytes survive the trip intact.
+round-trips correctly: a group can only be joined via a real signed
+invite (never by simply sending a gid-tagged message - see
+Peer._receive's owner/non-owner branches, which mirror
+app.py's MainWindow._file_incoming_group_message exactly), a group-tagged
+envelope sent to N real members is individually decryptable by each, and a
+file envelope's bytes survive the trip intact.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import time
 
 import crypto
 import envelope
+import group_invite as invite_mod
 import transport
 import vault as vm
 from transport import MessageServer, _recv_frame, _send_frame
@@ -49,6 +54,11 @@ class Peer:
         self.vault.create(passphrase)
         fake_onion = (name.lower() * 60)[:56] + ".onion"
         self.vault.set_onion(fake_onion, "ED25519-V3:fake")
+        self.acked_group_ids: set[str] = set()
+        # contact_id -> the other Peer's port, so _send_group_ack (fired
+        # from inside a MessageServer receive callback) can reply without
+        # needing a reference back to the whole test's Peer registry.
+        self._known_ports: dict[str, int] = {}
 
         self.server = MessageServer(
             on_message=self._receive,
@@ -71,14 +81,41 @@ class Peer:
         except envelope.EnvelopeError:
             return
 
+        if env.kind == envelope.KIND_GROUP_ACK:
+            self.acked_group_ids.add(env.gid)
+            return
+
+        if env.kind == envelope.KIND_GROUP_LEAVE:
+            group = self.vault.get_group(env.gid)
+            if group is not None and contact.id in group.member_contact_ids:
+                self.vault.remove_group_member(group.id, contact.id)
+            return
+
         if env.gid:
+            # Mirrors app.py's MainWindow._file_incoming_group_message
+            # exactly: a group this peer has no local record of at all
+            # (never created it, never redeemed an invite for it) is
+            # simply unrecognized - dropped, no auto-creation. Growing
+            # membership follows the same owner/non-owner split.
             group = self.vault.get_group(env.gid)
             if group is None:
-                group = self.vault.create_group_from_invite(
-                    env.gid, env.gname or "Group", contact.id,
-                )
-            elif contact.id not in group.member_contact_ids:
-                self.vault.add_group_member(group.id, contact.id)
+                return
+            already_member = contact.id in group.member_contact_ids
+            removed = contact.id in group.removed_contact_ids
+            if not already_member and not removed:
+                if group.owner_contact_id == "":
+                    if env.invcode and self.vault.redeem_group_invite_locally(group.id, env.invcode):
+                        try:
+                            self.vault.add_group_member(group.id, contact.id)
+                            self.vault.mark_group_invite_used(group.id, env.invcode, contact.id)
+                            self._send_group_ack(contact, group.id)
+                        except ValueError:
+                            pass
+                else:
+                    try:
+                        self.vault.add_group_member(group.id, contact.id)
+                    except ValueError:
+                        pass
             kwargs = dict(
                 contact_id=contact.id, direction="in", group_id=group.id,
                 sender_contact_id=contact.id,
@@ -93,6 +130,12 @@ class Peer:
             )
         else:
             self.vault.add_message(body=env.body, **kwargs)
+
+    def _send_group_ack(self, to_contact, gid: str) -> None:
+        peer_port = self._known_ports.get(to_contact.id)
+        if peer_port is None:
+            return
+        self.send_wire(to_contact, peer_port, envelope.encode_group_ack(gid))
 
     def send_wire(self, contact, peer_port: int, wire_body: str) -> tuple[bool, str]:
         """Deliver a pre-built wire envelope directly over localhost,
@@ -166,50 +209,157 @@ def main() -> None:
     time.sleep(0.4)
 
     # Full mesh contacts (a group here only ever fans out to contacts the
-    # sender already has - see vault.Group's docstring).
+    # sender already has - see vault.Group's docstring). Joining a group
+    # via invite additionally requires the invite's signed owner already
+    # be an accepted contact (see vault.join_group_from_invite) - so Ali
+    # and Sam must add Tamer, same as any normal first contact.
     ali_c = tamer.vault.add_contact("Ali", ali.address)
     sam_c = tamer.vault.add_contact("Sam", sam.address)
     tamer_c_at_ali = ali.vault.add_contact("Tamer", tamer.address)
     tamer_c_at_sam = sam.vault.add_contact("Tamer", tamer.address)
+    tamer._known_ports[ali_c.id] = ali.port
+    tamer._known_ports[sam_c.id] = sam.port
 
-    print("Group message fan-out:")
-    gid = "test-group-id-123"
-    gname = "Trip Planning"
+    print("Group creation and real signed invites (owner-issued, single-use, time-limited):")
+    # create_group()'s own member list is a *direct* local trust decision
+    # (the owner explicitly picking already-accepted contacts, same as
+    # add_contact) and makes them real members immediately - no invite
+    # needed for that initial set, same as always. The invite flow below
+    # is for GROWING a group after creation, which is exactly the case
+    # that used to be a security gap: ANY accepted contact who sent a
+    # matching gid got auto-added, with no invite at all. So this test
+    # creates the group naming only Tamer's placeholder self-member... a
+    # group cannot have zero initial members (create_group requires at
+    # least one - see the CRUD section above), so it starts with just one
+    # placeholder-free member set: create it with Sam already directly
+    # trusted, then invite Ali in afterward - covering both paths.
+    group = tamer.vault.create_group("Trip Planning", [sam_c.id])
+    check("Tamer is the group's owner", group.owner_contact_id == "")
+    check("Sam (named at creation) is an immediate real member, no invite needed", sam_c.id in group.member_contact_ids)
+    check("Ali (not named at creation) is NOT yet a member", ali_c.id not in group.member_contact_ids)
+
+    invite_for_ali = tamer.vault.create_group_invite(group.id, expiry_hours=1)
+    check("invite text uses the group-invite prefix", invite_for_ali.startswith(invite_mod.PREFIX))
+    check("one issued invite recorded on Tamer's side", len(tamer.vault.get_group(group.id).issued_invites) == 1)
+
+    ali_group = ali.vault.join_group_from_invite(invite_for_ali)
+    check("Ali's local group is owned by Tamer (not herself)", ali_group.owner_contact_id == tamer_c_at_ali.id)
+    check("Ali's local group uses the invite's group name", ali_group.name == "Trip Planning")
+    check("Ali is not yet a real member on Tamer's side (not redeemed yet)", ali_c.id not in tamer.vault.get_group(group.id).member_contact_ids)
+
+    reused = tamer.vault.redeem_group_invite_locally(
+        group.id, tamer.vault.get_group(group.id).issued_invites[0].code,
+    )
+    check("Tamer's own redeem-check (before any real redemption) reports the code as valid", reused)
+
+    # A DIFFERENT invite for Sam (an invite is meant for one recipient -
+    # sharing the same code with two people is exactly the "copy and
+    # reuse" risk group_invite.py's docstring is upfront about; a real
+    # deployment issues one invite per person for that reason).
+    invite_for_sam = tamer.vault.create_group_invite(group.id, expiry_hours=1)
+    sam_group = sam.vault.join_group_from_invite(invite_for_sam)
+    check("Sam's local group is also owned by Tamer", sam_group.owner_contact_id == tamer_c_at_sam.id)
+
+    print("\nGroup message fan-out (real membership only happens once the owner redeems the code):")
+    gid = group.id
+    gname = group.name
+    ali_invite_code = ali.vault.get_group(gid).joined_invite_code
+    sam_invite_code = sam.vault.get_group(gid).joined_invite_code
+    check("Ali's local record kept her own invite code", bool(ali_invite_code))
+    check("Sam's local record kept her own invite code", bool(sam_invite_code))
+
     wire_text = envelope.encode_text("Where should we go?", gid=gid, gname=gname)
 
+    # Tamer sends to Ali/Sam BEFORE either has redeemed anything - not
+    # possible for them to reply as real members yet, but this exercises
+    # the wire fan-out itself; the actual join happens below when Ali/Sam
+    # send their OWN first message carrying their invite code, which is
+    # what a real client does immediately after joining (see app.py's
+    # _wire_body_for/_acked_group_ids).
     ok_ali, _ = tamer.send_wire(ali_c, ali.port, wire_text)
     ok_sam, _ = tamer.send_wire(sam_c, sam.port, wire_text)
     check("delivered to Ali", ok_ali)
     check("delivered to Sam", ok_sam)
     time.sleep(0.3)
 
-    ali_group = ali.vault.get_group(gid)
-    sam_group = sam.vault.get_group(gid)
-    check("Ali auto-created the group locally", ali_group is not None)
-    check("Sam auto-created the group locally", sam_group is not None)
-    check("Ali's local group uses the sender's gname", ali_group is not None and ali_group.name == gname)
     check(
-        "Ali's group lists Tamer as a member",
-        ali_group is not None and tamer_c_at_ali.id in ali_group.member_contact_ids,
+        "message from Tamer filed under Ali's local group even before Ali is a real member",
+        any(m.body == "Where should we go?" for m in ali.vault.group_messages(ali_group)),
     )
 
-    ali_group_msgs = ali.vault.group_messages(ali_group) if ali_group else []
-    check("Ali received the group text", any(m.body == "Where should we go?" for m in ali_group_msgs))
+    # Ali replies, carrying her invite code - this is what actually makes
+    # her a member on Tamer's side (see Peer._receive's owner branch).
+    ali._known_ports[tamer_c_at_ali.id] = tamer.port
+    ok_ali_join, _ = ali.send_wire(
+        tamer_c_at_ali, tamer.port,
+        envelope.encode_text("I'm in!", gid=gid, gname=gname, invcode=ali_invite_code),
+    )
+    check("Ali's join-message delivered to Tamer", ok_ali_join)
+    time.sleep(0.3)
     check(
-        "message is attributed to Tamer as sender",
-        any(m.sender_contact_id == tamer_c_at_ali.id for m in ali_group_msgs),
+        "Tamer now lists Ali as a real member (code redeemed)",
+        ali_c.id in tamer.vault.get_group(gid).member_contact_ids,
+    )
+    check(
+        "Ali's invite is marked used on Tamer's side",
+        tamer.vault.get_group(gid).issued_invites[0].used,
+    )
+    check("Ali received a KIND_GROUP_ACK back", gid in ali.acked_group_ids)
+
+    # The SAME code, redeemed a second time (simulating someone copying
+    # Ali's invite text and trying to join with it too), must fail.
+    second_attempt_valid = tamer.vault.redeem_group_invite_locally(gid, ali_invite_code)
+    check("Ali's already-used invite code is refused on a second redemption", not second_attempt_valid)
+
+    # Sam does the same with her own, different invite code.
+    sam._known_ports[tamer_c_at_sam.id] = tamer.port
+    ok_sam_join, _ = sam.send_wire(
+        tamer_c_at_sam, tamer.port,
+        envelope.encode_text("Count me in too", gid=gid, gname=gname, invcode=sam_invite_code),
+    )
+    check("Sam's join-message delivered to Tamer", ok_sam_join)
+    time.sleep(0.3)
+    check(
+        "Tamer now lists Sam as a real member too (her own, different code)",
+        sam_c.id in tamer.vault.get_group(gid).member_contact_ids,
     )
 
-    # A second message with the same gid from Tamer must land in the SAME
-    # local group on Ali's side, not create a duplicate.
+    print("\nA stranger cannot spawn a group just by sending a gid-tagged message:")
+    fake_gid = "never-invited-to-this-one"
+    stranger_wire = envelope.encode_text("Let me in", gid=fake_gid, gname="Fake Group")
+    ok_stranger, _ = tamer.send_wire(ali_c, ali.port, stranger_wire)
+    check("wire delivery itself still succeeds (transport doesn't know about groups)", ok_stranger)
+    time.sleep(0.3)
+    check("Ali did NOT create a local group for an unrecognized gid", ali.vault.get_group(fake_gid) is None)
+
+    print("\nA second message with the same gid stays the SAME local group (no duplicate):")
     ok_ali2, _ = tamer.send_wire(ali_c, ali.port, envelope.encode_text("Beach?", gid=gid, gname=gname))
     check("second group message delivered", ok_ali2)
     time.sleep(0.3)
     check("still exactly one local group for this gid", ali.vault.get_group(gid) is ali_group)
     check(
-        "both group messages present in Ali's thread",
+        # Ali's own "I'm in!" join-message was sent via send_wire() (this
+        # test harness's low-level transport-only helper, which - unlike
+        # the real app's actual send path - never calls vault.add_message
+        # on the sending side to store its own outgoing copy) - so only
+        # Tamer's two INCOMING messages are expected here, not three.
+        "both of Tamer's incoming group messages present in Ali's thread",
         len(ali.vault.group_messages(ali_group)) == 2,
     )
+
+    print("\nGroup ownership: only the owner can delete, others can only leave:")
+    try:
+        ali.vault.delete_group(gid)
+        check("non-owner (Ali) cannot delete the group", False)
+    except ValueError:
+        check("non-owner (Ali) cannot delete the group", True)
+    try:
+        tamer.vault.leave_group(gid)
+        check("owner (Tamer) cannot leave their own group", False)
+    except ValueError:
+        check("owner (Tamer) cannot leave their own group", True)
+    ali.vault.leave_group(gid)
+    check("non-owner (Ali) can leave", ali.vault.get_group(gid) is None)
 
     print("\nFile/image transfer:")
     payload = bytes(range(256)) * 500  # 128 KB deterministic "image"

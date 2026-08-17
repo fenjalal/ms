@@ -93,7 +93,7 @@ modules:
       # One source codebase, staged verbatim - not a copy diverged for
       # this format. See packaging/common/copy-source.sh.
       - install -d /app/lib/veilwire
-      - cp app.py bundle.py crypto.py i18n.py paths.py platform_support.py theme.py
+      - cp app.py bundle.py crypto.py envelope.py group_invite.py i18n.py paths.py platform_support.py theme.py
           tor_service.py transport.py vault.py version.py /app/lib/veilwire/
       - cp -r icons /app/lib/veilwire/icons
       - install -d /app/lib/veilwire/translations

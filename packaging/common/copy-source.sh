@@ -23,6 +23,8 @@ APP_MODULES=(
     app.py
     bundle.py
     crypto.py
+    envelope.py
+    group_invite.py
     i18n.py
     paths.py
     platform_support.py

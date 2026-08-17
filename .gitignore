@@ -17,3 +17,5 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+dist/
+.claude/scheduled_tasks.lock

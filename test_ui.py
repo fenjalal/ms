@@ -540,6 +540,29 @@ def main() -> None:
     except OSError:
         pass
 
+    print("\nAttachments never auto-render inline - Save As... first, always:")
+    # The bug this guards against: an image attachment used to be decoded
+    # and embedded as a data: URI <img> directly in the thread the moment
+    # a message arrived - no user action required. That is a real
+    # attack-surface widening (Qt's rich-text renderer decoding
+    # attacker-controlled image bytes automatically on receipt) as well
+    # as inconsistent with every mainstream messenger's "tap/click to
+    # view" model. _attachment_html must never emit an <img> tag for any
+    # mime type, image included - only a filename/size/Save As... link.
+    class FakeAttachmentMessage:
+        id = "fake-msg-id"
+        attachment_filename = "photo.jpg"
+        attachment_mime = "image/jpeg"
+        attachment_size = 12345
+        body = "ZmFrZS1pbWFnZS1ieXRlcw=="  # base64, arbitrary - never decoded by this function anyway
+
+    fake_colors = theme.detect_palette(QApplication.instance())
+    attachment_html = appmod._attachment_html(FakeAttachmentMessage(), fake_colors)
+    check("no inline <img> tag for an image attachment", "<img" not in attachment_html)
+    check("no data: URI embedded either", "data:image" not in attachment_html)
+    check("filename is still shown", "photo.jpg" in attachment_html)
+    check("a Save As... link is still present", "attach:fake-msg-id" in attachment_html)
+
     print("\nBranding assets:")
     for asset in ("veilwire-chat.png", "veilwire-shield.png", "veilwire-send.png", "veilwire-network.png"):
         path = appmod.brand_image_path(asset)
