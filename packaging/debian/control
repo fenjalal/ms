@@ -1,0 +1,21 @@
+Package: veilwire
+Version: __VERSION__
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: Veilwire Project <veilwire@example.invalid>
+Depends: python3 (>= 3.9), python3-pyside6.qtcore, python3-pyside6.qtgui, python3-pyside6.qtwidgets, python3-nacl, python3-stem, python3-socks, python3-segno, tor
+Homepage: https://github.com/yourname/veilwire
+Description: Peer-to-peer encrypted messenger over Tor
+ Veilwire is a serverless, peer-to-peer encrypted messenger that
+ communicates exclusively through Tor v3 onion services. There is no
+ server, no account, and no phone number - your onion address and public
+ key are your whole identity. Messages are end-to-end encrypted with NaCl
+ (X25519 + XSalsa20-Poly1305) on top of Tor's own transport encryption,
+ and the local vault is encrypted at rest with a key derived from your
+ passphrase via Argon2id.
+ .
+ This package installs the application under /usr/lib/veilwire and a
+ launcher at /usr/bin/veilwire. It declares a dependency on the
+ distribution's own tor package rather than bundling one, so Tor receives
+ the distribution's normal security updates.

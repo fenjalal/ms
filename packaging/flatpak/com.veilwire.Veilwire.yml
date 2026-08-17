@@ -1,0 +1,113 @@
+app-id: com.veilwire.Veilwire
+# Placeholder reverse-DNS id using the project's own name, since no
+# registered domain exists yet - would need a real one before an actual
+# Flathub submission (out of scope for this packaging pass).
+
+runtime: org.kde.Platform
+runtime-version: '6.7'
+sdk: org.kde.Sdk
+command: veilwire
+
+finish-args:
+  # A display is required - this is a PySide6/Qt GUI application.
+  - --socket=x11
+  - --socket=wayland
+  # No --socket=pulseaudio: the application has no audio.
+  #
+  # Network access is required for the application to function at all
+  # (it is, after all, a messenger) - but this is NOT a weakening of its
+  # Tor-only design. The application only ever opens outbound connections
+  # via socks.socksocket() to 127.0.0.1:<local Tor SOCKS port> (verified
+  # in transport.py and covered by an automated static guard test,
+  # test_transport.py's check_no_direct_outbound_sockets, which asserts
+  # the module contains exactly one raw socket.socket() construction - the
+  # inbound Tor-fed listener - and nothing else). Flatpak's sandbox has no
+  # finer-grained network permission than all-or-nothing (there is no
+  # "loopback only" or "Tor only" primitive in the portal system), so this
+  # single broad-sounding permission is unavoidable for ANY networked
+  # Flatpak app, Tor-based or not - it is not scope creep, it is the
+  # coarsest unit Flatpak offers.
+  - --share=network
+  # GPU-accelerated Qt rendering. Omitting this forces software rendering
+  # (a performance/compatibility regression, not a security-relevant
+  # permission) - standard for any PySide6/Qt Flatpak.
+  - --device=dri
+  #
+  # Deliberately NOT granted, matching "do not simply give --filesystem=host
+  # or equivalent broad permissions":
+  #   --filesystem=host
+  #   --filesystem=home
+  #   --talk-name=<anything> (no D-Bus session bus access)
+  #   --allow=devel
+  #   --socket=pulseaudio
+  #   --socket=session-bus / --socket=system-bus
+  #
+  # No --persist=/--filesystem= override is needed for the vault at all:
+  # Flatpak already gives every app its own sandboxed XDG_DATA_HOME at
+  # ~/.var/app/com.veilwire.Veilwire/data, and paths.py (the application's
+  # single source of truth for where user data lives) already reads
+  # XDG_DATA_HOME rather than hardcoding ~/.local/share, so it picks up
+  # Flatpak's sandboxed location automatically with zero Flatpak-specific
+  # code and zero extra permission grant.
+
+# ---------------------------------------------------------------------------
+# KNOWN OPEN CAVEAT: Tor access inside the sandbox.
+#
+# Unlike a .deb/.rpm/Arch install (where the app can see a system `tor`
+# binary on PATH normally) or an AppImage (which runs unsandboxed), a
+# Flatpak's sandbox means the application cannot see an arbitrary system
+# `tor` binary or its control socket unless explicitly given a narrow
+# filesystem/D-Bus permission for it. This packaging pass deliberately does
+# NOT bundle Tor inside the Flatpak (same reasoning as the AppImage: a
+# vendored Tor binary goes stale and unpatched with no update mechanism
+# here), and does NOT grant a broad permission to work around it either.
+#
+# The two real options, neither implemented here because both require a
+# decision beyond this pass's scope:
+#   1. Depend on a Tor Flatpak runtime/extension from Flathub, if a
+#      suitably maintained one exists, and have this manifest declare
+#      that as a dependency.
+#   2. Grant a narrow, specific permission such as
+#      --filesystem=/usr/bin/tor:ro (read-only access to just the Tor
+#      binary path) or a --talk-name to a system Tor's D-Bus-exposed
+#      control interface if the distro's Tor exposes one - narrower than
+#      --filesystem=host, but still a real, disclosed exception to "no
+#      host filesystem access" that needs a considered decision, not a
+#      default.
+#
+# Until one of those is chosen, Tor connectivity from the Flatpak build of
+# this application is NOT guaranteed to work out of the box - flagged here
+# explicitly rather than silently shipping a broken or falsely-secure
+# permission set.
+# ---------------------------------------------------------------------------
+
+modules:
+  - name: veilwire
+    buildsystem: simple
+    build-commands:
+      # Python dependencies, pinned to the same version floors as
+      # requirements.txt (the single dependency source of truth for this
+      # project) - not a separate, driftable Flatpak-only dependency list.
+      - pip3 install --no-index --find-links="file://${PWD}/python-deps" --prefix=/app --no-build-isolation
+          "PySide6>=6.6" "PyNaCl>=1.5" "stem>=1.8" "PySocks>=1.7" "segno>=1.6"
+      # One source codebase, staged verbatim - not a copy diverged for
+      # this format. See packaging/common/copy-source.sh.
+      - install -d /app/lib/veilwire
+      - cp app.py bundle.py crypto.py i18n.py paths.py platform_support.py theme.py
+          tor_service.py transport.py vault.py version.py /app/lib/veilwire/
+      - cp -r icons /app/lib/veilwire/icons
+      - install -d /app/lib/veilwire/translations
+      - cp translations/*.qm /app/lib/veilwire/translations/
+      - install -Dm755 packaging-launcher.sh /app/bin/veilwire
+      - install -Dm644 veilwire.desktop /app/share/applications/com.veilwire.Veilwire.desktop
+      - install -Dm644 icons/veilwire-256.png /app/share/icons/hicolor/256x256/apps/com.veilwire.Veilwire.png
+    sources:
+      # flatpak-builder builds from a manifest-relative source list, not a
+      # remote tarball, for the same "one codebase" reason every other
+      # format stages from the repo root directly. In practice, run this
+      # via packaging/flatpak/build.sh, which materializes this sources:
+      # list into the build directory from packaging/common/copy-source.sh
+      # before invoking flatpak-builder - kept here as a manifest for
+      # documentation/inspection, with build.sh doing the actual staging.
+      - type: dir
+        path: ../..

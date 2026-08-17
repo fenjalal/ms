@@ -1,0 +1,252 @@
+"""
+theme.py
+
+Visual styling for the application.
+
+The original message bubbles set a background colour but left the text colour
+to the system palette. On a dark desktop that meant light text on a light
+bubble - invisible. Every colour pair here is therefore defined together, and
+the palette is chosen from the actual window background rather than assumed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from PySide6.QtGui import QPalette
+
+
+@dataclass(frozen=True)
+class Palette:
+    """A complete set of colours. Text and background are always paired."""
+
+    is_dark: bool
+
+    window: str
+    surface: str
+    border: str
+
+    text: str
+    text_muted: str
+
+    accent: str
+    accent_hover: str
+    accent_pressed: str
+    accent_text: str
+
+    # Message bubbles - each with its own text colour.
+    bubble_out_bg: str
+    bubble_out_text: str
+    bubble_in_bg: str
+    bubble_in_text: str
+
+    ok: str
+    warn: str
+    error: str
+
+
+LIGHT = Palette(
+    is_dark=False,
+    window="#ffffff",
+    surface="#f5f6f8",
+    border="#d8dbe0",
+    text="#1a1c1e",
+    text_muted="#6b7075",
+    accent="#6b3fa0",
+    accent_hover="#7d4cb8",
+    accent_pressed="#5a3488",
+    accent_text="#ffffff",
+    bubble_out_bg="#6b3fa0",
+    bubble_out_text="#ffffff",
+    bubble_in_bg="#eceef1",
+    bubble_in_text="#1a1c1e",
+    ok="#2e7d32",
+    warn="#ef6c00",
+    error="#c62828",
+)
+
+DARK = Palette(
+    is_dark=True,
+    window="#1c1e21",
+    surface="#25282c",
+    border="#3a3e44",
+    text="#e8eaed",
+    text_muted="#9aa0a6",
+    accent="#9d6fd4",
+    accent_hover="#ae83e0",
+    accent_pressed="#8659bd",
+    accent_text="#121315",
+    bubble_out_bg="#5b3a8a",
+    bubble_out_text="#f2ecfa",
+    bubble_in_bg="#2f3338",
+    bubble_in_text="#e8eaed",
+    ok="#66bb6a",
+    warn="#ffa726",
+    error="#ef5350",
+)
+
+
+def detect_palette(app) -> Palette:
+    """
+    Pick a palette by inspecting the real window background.
+
+    Reading the palette beats guessing from a desktop environment variable,
+    which is unreliable across the many Linux desktops this app supports.
+    """
+    try:
+        background = app.palette().color(QPalette.Window)
+        # Rec. 601 luma: a reasonable perceptual brightness approximation.
+        luma = (
+            0.299 * background.red()
+            + 0.587 * background.green()
+            + 0.114 * background.blue()
+        )
+        return DARK if luma < 128 else LIGHT
+    except Exception:
+        return LIGHT
+
+
+def stylesheet(p: Palette) -> str:
+    """The full application stylesheet, built from a palette."""
+    return f"""
+    QWidget {{
+        background-color: {p.window};
+        color: {p.text};
+        font-size: 14px;
+    }}
+
+    QLineEdit, QTextEdit, QTextBrowser, QListWidget {{
+        background-color: {p.surface};
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: 6px;
+        padding: 6px;
+        selection-background-color: {p.accent};
+        selection-color: {p.accent_text};
+    }}
+
+    QLineEdit:focus, QTextEdit:focus {{
+        border: 1px solid {p.accent};
+    }}
+
+    QLineEdit[readOnly="true"] {{
+        color: {p.text_muted};
+    }}
+
+    QListWidget::item {{
+        padding: 8px 6px;
+        border-radius: 4px;
+    }}
+    QListWidget::item:selected {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+    }}
+    QListWidget::item:hover:!selected {{
+        background-color: {p.border};
+    }}
+
+    /* Buttons must read as buttons: solid fill, clear border, hover feedback. */
+    QPushButton {{
+        background-color: {p.surface};
+        color: {p.text};
+        border: 1px solid {p.border};
+        border-radius: 6px;
+        padding: 7px 14px;
+        min-height: 18px;
+    }}
+    QPushButton:hover {{
+        background-color: {p.border};
+        border: 1px solid {p.accent};
+    }}
+    QPushButton:pressed {{
+        background-color: {p.accent_pressed};
+        color: {p.accent_text};
+    }}
+    QPushButton:disabled {{
+        color: {p.text_muted};
+        border: 1px solid {p.border};
+        background-color: transparent;
+    }}
+
+    /* The primary action. */
+    QPushButton#primary {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+        border: 1px solid {p.accent};
+        font-weight: bold;
+        font-size: 15px;
+        min-height: 26px;
+        padding: 9px 16px;
+    }}
+    QPushButton#primary:hover {{
+        background-color: {p.accent_hover};
+        border: 1px solid {p.accent_hover};
+    }}
+    QPushButton#primary:pressed {{
+        background-color: {p.accent_pressed};
+    }}
+    QPushButton#primary:disabled {{
+        background-color: {p.border};
+        color: {p.text_muted};
+        border: 1px solid {p.border};
+    }}
+
+    QPushButton#danger {{
+        border: 1px solid {p.error};
+        color: {p.error};
+    }}
+    QPushButton#danger:hover {{
+        background-color: {p.error};
+        color: #ffffff;
+    }}
+
+    QLabel {{
+        background-color: transparent;
+    }}
+    QLabel#muted {{
+        color: {p.text_muted};
+    }}
+    QLabel#heading {{
+        font-weight: bold;
+        font-size: 15px;
+    }}
+
+    QCheckBox {{
+        spacing: 8px;
+    }}
+
+    QSplitter::handle {{
+        background-color: {p.border};
+        width: 1px;
+    }}
+
+    QMenu {{
+        background-color: {p.surface};
+        border: 1px solid {p.border};
+    }}
+    QMenu::item:selected {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+    }}
+
+    QScrollBar:vertical {{
+        background: transparent;
+        width: 10px;
+        margin: 0;
+    }}
+    QScrollBar::handle:vertical {{
+        background: {p.border};
+        border-radius: 5px;
+        min-height: 30px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: {p.text_muted};
+    }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+        height: 0;
+    }}
+
+    QDialog {{
+        background-color: {p.window};
+    }}
+    """

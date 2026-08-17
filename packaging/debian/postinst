@@ -1,0 +1,19 @@
+#!/bin/sh
+# Runs as root during package installation/upgrade (dpkg's normal
+# maintainer-script privilege). Deliberately does nothing but refresh
+# desktop/icon caches - it must NEVER reach into any user's home directory
+# (that is not root's data to create, own, or modify), and in particular
+# must never create, touch, or overwrite ~/.local/share/veilwire/vault.dat
+# for any user. The vault is created by the application itself, running as
+# the user, the first time they launch it - not by this script.
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
+exit 0

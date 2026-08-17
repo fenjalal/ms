@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Veilwire
+GenericName=Encrypted Messenger
+Comment=Private peer-to-peer encrypted messenger over Tor
+Exec=veilwire
+Icon=veilwire
+Terminal=false
+Categories=Network;Chat;InstantMessaging;Security;
+Keywords=tor;onion;encrypted;messenger;privacy;p2p;
+StartupNotify=true

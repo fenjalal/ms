@@ -1,0 +1,26 @@
+#!/bin/sh
+# Runs after package files are removed. dpkg has already deleted
+# /usr/lib/veilwire, /usr/bin/veilwire, the desktop entry, and the icons
+# by the time this runs - this script only refreshes caches.
+#
+# This script NEVER touches ~/.local/share/veilwire or ~/.config/veilwire
+# for any user, on ANY removal path ($1 = remove, purge, upgrade, etc.).
+# The encrypted vault (identity, contacts, message history) is per-user
+# data that a package uninstall has no business deleting - not on a plain
+# "apt remove", and not on "apt purge" either, since dpkg's purge convention
+# is about system-level configuration (typically /etc), not a user's
+# private, encrypted, irreplaceable data. If the user wants their vault
+# gone, that must be an explicit, deliberate action they take themselves
+# (e.g. rm -rf ~/.local/share/veilwire), never an automatic side effect of
+# a package operation.
+set -e
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+
+exit 0

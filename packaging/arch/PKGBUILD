@@ -1,0 +1,41 @@
+# Maintainer: Veilwire Project <veilwire@example.invalid>
+#
+# BUILD NOTE: makepkg is an Arch-family tool (Arch Linux, Manjaro,
+# EndeavourOS, or a container/chroot targeting one of those) - it is not
+# available on every Linux distribution, and is not present, for example,
+# on the Debian/Kali machine this packaging system was developed on. See
+# packaging/arch/build.sh for a wrapper that stages the application source
+# via the same packaging/common/copy-source.sh helper every other format
+# uses, then hands off to makepkg.
+pkgname=veilwire
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Peer-to-peer encrypted messenger over Tor"
+arch=('x86_64')
+url="https://github.com/yourname/veilwire"
+license=('MIT')
+depends=('python' 'pyside6' 'python-pynacl' 'python-stem' 'python-pysocks' 'python-segno' 'tor')
+options=('!strip')
+
+# The build.sh wrapper stages the application source and this PKGBUILD's
+# own launcher/desktop/icon files into $srcdir before makepkg runs, so
+# this file has no source= array pointing at a remote tarball - it builds
+# from the local, already-staged tree, matching the "one codebase, no
+# per-distro fork" requirement.
+
+package() {
+    install -dm755 "$pkgdir/usr/lib/veilwire"
+    cp -r "$srcdir/app/"* "$pkgdir/usr/lib/veilwire/"
+    find "$pkgdir/usr/lib/veilwire" -type f -exec chmod 0644 {} \;
+    find "$pkgdir/usr/lib/veilwire" -type d -exec chmod 0755 {} \;
+
+    install -Dm755 "$srcdir/veilwire-launcher.sh" "$pkgdir/usr/bin/veilwire"
+    install -Dm644 "$srcdir/veilwire.desktop" "$pkgdir/usr/share/applications/veilwire.desktop"
+
+    for size in 16 24 32 48 64 128 256 512; do
+        if [ -f "$srcdir/icons/veilwire-${size}.png" ]; then
+            install -Dm644 "$srcdir/icons/veilwire-${size}.png" \
+                "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/veilwire.png"
+        fi
+    done
+}

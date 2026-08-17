@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs before package files are removed (both plain "remove" and "purge").
+# Intentionally empty of any action beyond letting dpkg do its normal file
+# removal under /usr - present only so the maintainer-script set is
+# complete and explicit about doing nothing destructive here.
+set -e
+exit 0

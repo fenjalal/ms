@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.veilwire.Veilwire</id>
+  <name>Veilwire</name>
+  <summary>Peer-to-peer encrypted messenger over Tor</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Veilwire is a serverless, peer-to-peer encrypted messenger that
+      communicates exclusively through Tor v3 onion services. There is no
+      server, no account, and no phone number - your onion address and
+      public key are your whole identity.
+    </p>
+  </description>
+  <launchable type="desktop-id">veilwire.desktop</launchable>
+  <url type="homepage">https://github.com/yourname/veilwire</url>
+  <provides>
+    <binary>veilwire</binary>
+  </provides>
+</component>

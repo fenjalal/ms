@@ -1,0 +1,20 @@
+#!/bin/sh
+# AppImage entry point. Activates the bundled venv (built at AppImage
+# build time by packaging/appimage/build.sh, containing exactly the
+# dependencies in requirements.txt - no separate AppImage-only dependency
+# list) and runs the application source staged under usr/lib/veilwire.
+#
+# Tor is deliberately NOT bundled in this AppImage. Bundling a static Tor
+# binary would mean shipping a copy that goes stale and unpatched the
+# moment a security fix lands upstream, with no mechanism here to update
+# it - exactly what the project was told not to do. Instead this AppImage
+# relies entirely on the application's own existing Tor detection
+# (platform_support.tor_is_installed() / tor_service.TorManager, both
+# already built and tested) which looks for a system `tor` on PATH (an
+# AppImage runs unsandboxed, so it can see the host's PATH normally,
+# unlike Flatpak) and shows the app's own existing "Tor is required..."
+# error dialog if none is found - no new error-handling code needed here,
+# this file just declines to pre-empt that behavior with a bundled Tor.
+HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
+
+exec "$HERE/usr/venv/bin/python3" "$HERE/usr/lib/veilwire/app.py" "$@"
