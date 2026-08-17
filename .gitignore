@@ -1,6 +1,19 @@
+# Encrypted identity + message vault - NEVER commit this
 vault.dat
+vault.dat.tmp
+
+# Tor state (contains the onion service key material)
 tor-data/
+
+# Python
 __pycache__/
-.venv/
-dist/
 *.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

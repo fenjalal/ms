@@ -1,6 +1,0 @@
-vault.dat
-tor-data/
-__pycache__/
-.venv/
-dist/
-*.pyc
