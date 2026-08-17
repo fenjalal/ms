@@ -259,6 +259,77 @@ storing messages for later, so if your contact is offline the send fails and
 is marked "Not delivered" in the thread. This is a direct consequence of
 having no infrastructure — see Limitations.
 
+### Sending a file or image
+
+Click the paperclip button next to **Send** and pick a file. It is sent the
+same way a text message is - end-to-end encrypted with NaCl Box, then
+through Tor - with no separate upload step and nothing ever touching a
+server. Images get an inline preview; anything else shows a filename and
+size with a **Save As...** link. Attachments are limited to 8 MB and, once
+received, are stored inside the same encrypted `vault.dat` as everything
+else - never auto-written to a loose file on disk.
+
+**Sending an image, you get an extra choice: "Send Compressed" (recommended)
+or "Send Original".** This is a security decision, not a quality one - a
+file that merely *claims* to be an image is a real way to smuggle something
+else to a contact, and "Send Compressed" fully decodes the image and
+rebuilds it from scratch as a fresh JPEG, so only the decoded picture itself
+is ever sent, never any of the original file's raw bytes beyond that (which
+also strips embedded metadata, like GPS location, along the way). A file
+that fails to decode as an image at all is flagged rather than sent - a
+strong sign it is not really an image. "Send Original" stays available for
+when you trust the file and need the exact bytes, e.g. for quality or
+provenance. Be clear about the limit of this: it protects against a
+disguised or booby-trapped *file*, not against a flaw in the image decoder
+itself on either end - that is a deeper class of risk no re-encoding step
+can fix. See `app._recompress_image_bytes`'s docstring for the precise,
+unexaggerated claim.
+
+### Deleting a message ("delete for everyone")
+
+Every message bubble you sent yourself - text or file, delivered or still
+queued - has a small **Delete** link. Only your own messages ever offer it;
+there is no way to delete a message someone else sent you, on either side of
+the conversation. Choosing it does two things: it immediately blanks that
+message in your own vault (the bubble stays in place, showing "This message
+was deleted", rather than leaving a confusing gap), and it queues a real
+"delete" notification to whoever received it - sent the exact same way any
+other message is, end-to-end encrypted straight to their onion address, with
+no server involved and nothing to delete "on a backend" because there isn't
+one. If they are offline right now, the notification waits in your own
+queue and keeps retrying, same as a text message would, until it gets
+through - deleting does not require the original message to have been
+delivered first.
+
+The receiving side only ever acts on a delete request for a message it can
+verify actually came from that same sender - it is impossible for anyone to
+delete a message *you* sent, or a message a different contact sent you, by
+naming its id. See `envelope.py`'s module docstring and
+`vault.Vault.mark_deleted()`/`queue_delete_request()` for the mechanism, and
+`test_delete.py` for an explicit test of a forged delete attempt being
+rejected.
+
+One honest limitation: a message sent before this feature existed has no
+delete link, since there is no reliable shared id to delete it by (older
+versions never generated one, and nothing else survives to give one
+retroactively) - it can be removed locally by deleting the contact or
+editing `vault.dat` directly, but not remotely.
+
+### Group chat
+
+**New Group** in the sidebar lets you name a group and pick members from
+contacts you have already added - a group can only be built from people
+already in your address book, since a message still has to be individually
+sent, end-to-end encrypted, straight to each member's own onion address.
+
+Sending in a group is really one individually encrypted message per member,
+delivered the same way a 1:1 message is (including the same offline queue
+and retry behavior). There is no group server and no shared membership
+list: each participant sets up the group's member list on their own side,
+and the first group message from someone introduces that group to your
+client if you do not already have it. See Limitations for what this does
+and does not guarantee.
+
 ---
 
 ## Threat model
@@ -299,6 +370,11 @@ Be clear about what this does and does not protect against.
 - **A malicious contact.** Anyone you talk to can screenshot, log, or leak the
   conversation. Encryption controls who *can* read a message, never what they
   do with it afterwards.
+- **"Delete for everyone" undoing something already seen.** Deleting a
+  message removes it from both vaults going forward - it cannot reach back
+  and un-show something the recipient already read, screenshotted, or copied
+  out before you deleted it. It also cannot delete anything from a backup of
+  their vault made before the deletion arrived.
 - **A weak passphrase.** Argon2id makes guessing expensive, not impossible.
   Use a long passphrase.
 - **Contact bundle interception.** The bundle is signed, not encrypted:
@@ -345,9 +421,18 @@ The simplest real fix for offline delivery is to be online all the time. Run
 onionmsg on a machine that never sleeps — a VPS, a Raspberry Pi, a home
 server — and your address is always reachable. Your identity lives in
 `vault.dat`, so restore an identity backup there and it *is* you.
-- **Text only.** No file transfer, voice, video, or group chat.
-- **Tor is slow.** Expect a few seconds per message. That is the cost of
-  routing through three relays.
+- **Group chat has no shared roster.** A group is a local label each member
+  sets up on their own side over their existing 1:1 contacts (see
+  "Group chat" below) - there is no server to hold a group's membership, so
+  adding or removing someone on your side does not change what anyone
+  else's client shows. Voice and video are still not supported.
+- **File/image attachments are capped at 8 MB** and sent as a single
+  message, same as text - no chunked/resumable transfer, and (like text) a
+  large attachment still needs both of you online at some point for it to
+  go through.
+- **Tor is slow.** Expect a few seconds per message, longer for an
+  attachment near the size limit. That is the cost of routing through
+  three relays.
 - **Desktop Linux only.**
 - **This is not audited software.** The cryptography comes from libsodium via
   PyNaCl and the transport from Tor — both well reviewed — but the code
@@ -366,6 +451,7 @@ onionmsg/
 ├── crypto.py                 # NaCl wrappers: keys, Box encryption, Argon2id KDF
 ├── vault.py                  # Encrypted store: identity, contacts, messages
 ├── bundle.py                 # Signed shareable contact bundle (P2PMSG1:...)
+├── envelope.py                # Structured message plaintext: text/file, group tag
 ├── tor_service.py            # Attaches to running Tor or launches one; health checks
 ├── platform_support.py       # Cross-distro detection: packages, groups, binaries
 ├── transport.py               # Wire protocol, listener, SOCKS5 client
@@ -379,6 +465,9 @@ onionmsg/
 ├── test_vault_concurrency.py   # Concurrent vault access, atomic saves
 ├── test_shutdown.py            # Start/stop cycles, connection flooding
 ├── test_bundle.py              # Contact bundle: signing, tampering, endpoint changes
+├── test_envelope.py            # Envelope encode/decode, legacy fallback, size limits
+├── test_groups_and_files.py    # Group fan-out, auto-join, file/image transfer end-to-end
+├── test_delete.py              # Delete-for-everyone, forged-delete rejection, image recompression
 ├── theme.py                   # Palette detection and the application stylesheet
 ├── version.py                 # Single source of truth for the version
 ├── make_icon.py                # Regenerates the icon PNGs
@@ -401,18 +490,30 @@ python3 test_py313.py             #  8 checks: Python 3.13+ threading compatibil
 python3 test_platform.py          # 28 checks: distro detection, health monitoring
 python3 test_keys.py              # 49 checks: keys, contact policy, backup/restore,
                                    #            impersonation detection, safe error text
-python3 test_ui.py                # 75 checks: theme contrast, controls, branding,
-                                   #            HTML-injection escaping, activity log,
-                                   #            onion address never in normal UI
+python3 test_ui.py                # 124 checks: theme contrast, controls, branding,
+                                   #             HTML-injection escaping, activity log,
+                                   #             onion address never in normal UI,
+                                   #             round send button, app icon,
+                                   #             group aggregate-delivery-note rendering
 python3 test_offline.py           # 19 checks: queueing, retry, presence
 python3 test_vault_concurrency.py # 10 checks: concurrent vault access, atomic saves
 python3 test_shutdown.py          # 12 checks: start/stop cycles, connection flooding
 python3 test_bundle.py            # 54 checks: bundle signing/tampering, clearnet
                                    #            rejection, endpoint-change detection,
                                    #            no-onion-in-logs guard
+python3 test_i18n.py              # 66 checks: translations, RTL, Settings dialog,
+                                   #            restart-to-apply-language flow,
+                                   #            no tr() call hidden inside an f-string
+python3 test_envelope.py          # 40 checks: text/file/group/delete envelope encode-decode,
+                                   #            legacy fallback, size limits, path safety
+python3 test_groups_and_files.py  # 30 checks: group CRUD, multi-party fan-out and
+                                   #            auto-join, end-to-end file/image transfer
+python3 test_delete.py            # 35 checks: delete-for-everyone (local tombstone,
+                                   #            queued wire notification, forged-delete
+                                   #            rejection), image recompression choice
 ```
 
-305 checks in total.
+525 checks in total.
 
 Both suites run without Tor by connecting over localhost; everything above the
 transport is the real production code path.

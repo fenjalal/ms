@@ -318,13 +318,25 @@ def main() -> None:
     print("\nControls:")
     window, colors, store = build_window(app, "#1c1e21", "/tmp/uitest_ctrl.dat")
 
-    check("send button styled as primary", window.send_button.objectName() == "primary")
+    # Round, icon-only "sendButton" is the normal case (the brand send icon
+    # ships with the app - see app.py's _build_conversation_panel); a
+    # rectangular labeled "primary" button is only the fallback if that
+    # asset is ever missing. Either is a legitimately styled send action.
+    check(
+        "send button styled as sendButton or primary",
+        window.send_button.objectName() in ("sendButton", "primary"),
+    )
+    check(
+        "send button has an icon when styled as sendButton",
+        window.send_button.objectName() != "sendButton" or not window.send_button.icon().isNull(),
+    )
     check("send button sized by stylesheet", "min-height" in theme.stylesheet(colors))
     check("send button renders tall enough", window.send_button.sizeHint().height() >= 34)
     check("check button has real height", window.check_button.minimumHeight() >= 24)
     check("stylesheet defines button borders", "QPushButton" in theme.stylesheet(colors))
     check("stylesheet defines hover state", ":hover" in theme.stylesheet(colors))
     check("stylesheet defines primary variant", "#primary" in theme.stylesheet(colors))
+    check("stylesheet defines round send-button variant", "#sendButton" in theme.stylesheet(colors))
 
     print("\nVersion and branding:")
     expected = f"v{version.__version__}"
@@ -467,6 +479,64 @@ def main() -> None:
     window.close()
     try:
         os.remove(jargon_path)
+    except OSError:
+        pass
+
+    print("\nGroup conversation rendering (aggregate delivery notes):")
+    # Regression test for a real crash this test suite did not previously
+    # catch: MainWindow._render_group_conversation's "some members still
+    # pending" and "no members delivered yet" notes used to build their
+    # text via i18n.trf(template, n=total) - but trf()'s own `n` parameter
+    # is reserved for Qt's numerus (plural-form) selector, so a caller's
+    # n=total meant for %(n)s substitution never reached %-formatting,
+    # and rendering a group message with 0 (but not all) members
+    # delivered raised KeyError('n') the instant that branch was hit. Both
+    # branches are exercised below.
+    group_path = "/tmp/uitest_group.dat"
+    try:
+        os.remove(group_path)
+    except OSError:
+        pass
+    group_store = vm.Vault(group_path)
+    group_store.create("group ui test passphrase")
+    group_store.set_onion("f" * 56 + ".onion", "ED25519-V3:K")
+    m1 = group_store.add_contact("Mona", vm.format_address("g" * 56 + ".onion", crypto.b64encode(crypto.generate_keypair()[1])))
+    m2 = group_store.add_contact("Nabil", vm.format_address("h" * 56 + ".onion", crypto.b64encode(crypto.generate_keypair()[1])))
+    m3 = group_store.add_contact("Omar", vm.format_address("i" * 56 + ".onion", crypto.b64encode(crypto.generate_keypair()[1])))
+    test_group = group_store.create_group("Trio", [m1.id, m2.id, m3.id])
+
+    # All delivered.
+    group_store.add_message(m1.id, "out", "hi all", group_id=test_group.id, client_msg_id="gc1", status=vm.SENT)
+    group_store.add_message(m2.id, "out", "hi all", group_id=test_group.id, client_msg_id="gc1", status=vm.SENT)
+    group_store.add_message(m3.id, "out", "hi all", group_id=test_group.id, client_msg_id="gc1", status=vm.SENT)
+    # None delivered yet (this is the branch that used to crash).
+    group_store.add_message(m1.id, "out", "second msg", group_id=test_group.id, client_msg_id="gc2", status=vm.QUEUED)
+    group_store.add_message(m2.id, "out", "second msg", group_id=test_group.id, client_msg_id="gc2", status=vm.QUEUED)
+    group_store.add_message(m3.id, "out", "second msg", group_id=test_group.id, client_msg_id="gc2", status=vm.QUEUED)
+    # Partially delivered.
+    group_store.add_message(m1.id, "out", "third msg", group_id=test_group.id, client_msg_id="gc3", status=vm.SENT)
+    group_store.add_message(m2.id, "out", "third msg", group_id=test_group.id, client_msg_id="gc3", status=vm.QUEUED)
+    group_store.add_message(m3.id, "out", "third msg", group_id=test_group.id, client_msg_id="gc3", status=vm.QUEUED)
+
+    group_window = appmod.MainWindow(group_store)
+    group_window._reload_contacts(select_id=test_group.id)
+    try:
+        group_window._render_conversation(None, group=test_group)
+        rendered_ok = True
+    except Exception as exc:  # noqa: BLE001
+        rendered_ok = False
+        print(f"    EXCEPTION: {exc!r}")
+    check("group conversation with a 0-of-N delivered message renders without raising", rendered_ok)
+
+    if rendered_ok:
+        group_html = group_window.thread_view.toHtml()
+        check("all-delivered group message shows 'Delivered'", "Delivered" in group_html)
+        check("0-of-N group message shows the real member count (not a raw KeyError)", "3 member" in group_html or "Waiting for 3" in group_html)
+        check("partially-delivered group message shows the aggregate count", "1" in group_html and "3" in group_html)
+
+    group_window.close()
+    try:
+        os.remove(group_path)
     except OSError:
         pass
 

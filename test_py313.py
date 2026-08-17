@@ -57,7 +57,15 @@ def simulate_future_python() -> None:
     original = threading.Thread.__init__
     # Captured once, before patching, so building a fresh handle below does
     # not recurse back through the patched __init__.
-    handle_cls = threading.Thread()._handle.__class__
+    #
+    # On 3.13+, threading.Thread already has a real `_handle` attribute of
+    # type `_thread._ThreadHandle`, and `Thread.start()` requires that exact
+    # type. On earlier versions (this interpreter) `_handle` does not exist
+    # yet, and `start()` does not check its type at all, so any placeholder
+    # object is sufficient to simulate "some future Python sets this name".
+    probe = threading.Thread()
+    real_handle = getattr(probe, "_handle", None)
+    handle_cls = type(real_handle) if real_handle is not None else object
 
     def patched(self, *args, **kwargs):
         original(self, *args, **kwargs)

@@ -67,6 +67,71 @@ class Message:
     status: str = SENT
     attempts: int = 0
     last_attempt: str = ""
+    # Group messaging (added for the group-chat feature; "" on every
+    # message that predates it or that isn't part of a group, so old vault
+    # files keep loading unchanged - same migration pattern as
+    # Contact.signing_public_key above).
+    #
+    # group_id: non-empty for a group message. There is no server, so a
+    # "group" is simply this vault's own local label for a set of contacts
+    # (see Group below) - a group message is really N individually
+    # Box-encrypted 1:1 sends, one per member, each stored as an ordinary
+    # Message on that member Contact's own messages list. group_id is what
+    # lets the UI pull them back out and render them together as one
+    # thread instead of N separate contact conversations.
+    group_id: str = ""
+    # client_msg_id: shared by every per-member copy of the SAME outgoing
+    # group message (one Message per member, N Messages, one client_msg_id)
+    # so the UI can collapse them into a single bubble and show an
+    # aggregate delivery count ("Delivered to 2/3") instead of N duplicate
+    # bubbles. Irrelevant for incoming messages and for ordinary 1:1
+    # messages, which is why it is not simply reusing `id`.
+    client_msg_id: str = ""
+    # sender_contact_id: for an incoming group message, the id of the
+    # member contact who actually sent it (this Message is stored under
+    # that same contact's messages list, so it is redundant with the list
+    # it lives in - kept anyway so the UI does not have to thread contact
+    # identity through separately when flattening several members' lists
+    # into one merged, timestamp-sorted view). Empty for outgoing messages
+    # (direction "out" already means "sent by me", same convention 1:1
+    # threads already use) and for non-group messages.
+    sender_contact_id: str = ""
+    # File/image attachment (added for the file-transfer feature). Empty
+    # for an ordinary text message. When set, `body` holds the raw base64
+    # file bytes (the same base64 the wire envelope carried - see
+    # envelope.py) rather than display text, and attachment_filename /
+    # attachment_mime describe it. Kept inside the same encrypted vault.dat
+    # as everything else rather than ever being auto-written to a loose
+    # file on disk - the user explicitly chooses where to save it (see
+    # app.py's "Save As...").
+    attachment_filename: str = ""
+    attachment_mime: str = ""
+    attachment_size: int = 0
+    # "Delete for everyone" (added for the message-deletion feature; default
+    # False so old vault files keep loading unchanged - same migration
+    # pattern as every other field on this dataclass).
+    #
+    # deleted: this message has been tombstoned - its content is gone
+    # (mark_deleted() scrubs body/attachment_* below) but the row itself is
+    # kept, in place, so the thread still shows *that* something was sent
+    # and deleted rather than leaving a confusing gap or reordering
+    # everything else. Set on the sender's own copy when they choose to
+    # delete a message they sent, and set on a recipient's copy when a
+    # "delete" envelope arrives (see envelope.py) - never set on a message
+    # by anyone other than the contact who originally sent it; that check
+    # happens in mark_deleted()'s caller (app.py), which only ever applies
+    # it to a message whose direction/sender already matches the delete
+    # request's sender. See mark_deleted() below.
+    deleted: bool = False
+    # is_delete_request: this Message row is not a displayed chat message at
+    # all - it is a synthetic outgoing entry (direction "out") queued so the
+    # existing retry/delivery-worker machinery (queued_messages(),
+    # mark_message()) can carry a "delete" envelope (see envelope.py) to the
+    # peer(s) the same battle-tested way it already carries "text"/"file"
+    # envelopes, without inventing a second delivery path. Its client_msg_id
+    # is the id of the message being deleted (not its own), and its body is
+    # always empty. See queue_delete_request() below.
+    is_delete_request: bool = False
 
 
 # A contact is in exactly one of these states.
@@ -117,6 +182,41 @@ class Contact:
         if self.messages:
             return max(m.timestamp for m in self.messages)
         return self.added
+
+
+# Cosmetic bound, same reasoning as MAX_CONTACT_NAME_LENGTH.
+MAX_GROUP_NAME_LENGTH = 100
+# A group with no members would just be a private notes file to yourself
+# under a confusing UI, and one with an unbounded member count means an
+# outgoing message fans out to that many individual Tor sends per message -
+# generous for real small-group use, bounded to keep a single send from
+# taking arbitrarily long.
+MAX_GROUP_MEMBERS = 50
+
+
+@dataclass
+class Group:
+    """
+    A group is this vault's own local label for a set of already-added
+    contacts - there is no server, so there is no shared, authoritative
+    group roster the way a centralized chat app has one. Each participant
+    creates a Group on their own side naming the same members; sending a
+    group message is really N individually Box-encrypted, individually
+    Tor-delivered 1:1 sends (see Vault.send-side helpers in app.py), tagged
+    with this group's id so every member's client can render them together.
+
+    Because membership lives only in each member's own vault, adding or
+    removing a member on your side does not change what anyone else's
+    client shows - same as the rest of this app's "no shared state,
+    nothing to synchronize" design, just applied to groups instead of
+    contacts. This is a real limitation (see README) worth being upfront
+    about rather than implying a synced roster that does not exist.
+    """
+
+    id: str
+    name: str
+    created: str
+    member_contact_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -215,6 +315,7 @@ class Vault:
         self._salt: bytes | None = None
         self.identity: Identity | None = None
         self.contacts: list[Contact] = []
+        self.groups: list[Group] = []
         # Guards every read/mutation of identity/contacts and every save().
         # This object is called concurrently from the Qt UI thread, the
         # DeliveryWorker thread, and MessageServer's connection-handler
@@ -249,6 +350,7 @@ class Vault:
                 signing_public_key=signing_pub_b64,
             )
             self.contacts = []
+            self.groups = []
             self.save()
 
     def unlock(self, passphrase: str) -> None:
@@ -282,6 +384,10 @@ class Vault:
                 )
                 for c in data.get("contacts", [])
             ]
+            # Absent entirely on a vault saved before the group-chat feature
+            # existed - defaults to no groups, same "old file keeps working
+            # unchanged" migration as everything else in this method.
+            self.groups = [Group(**g) for g in data.get("groups", [])]
 
             # Lazy, automatic, one-time migration: a vault saved before the
             # bundle feature existed has no signing keypair (the dataclass
@@ -302,6 +408,7 @@ class Vault:
             self._key = None
             self.identity = None
             self.contacts = []
+            self.groups = []
 
     def save(self) -> None:
         with self._lock:
@@ -311,6 +418,7 @@ class Vault:
             payload = {
                 "identity": asdict(self.identity),
                 "contacts": [asdict(c) for c in self.contacts],
+                "groups": [asdict(g) for g in self.groups],
             }
             plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             ciphertext = crypto.encrypt_blob(plaintext, self._key)
@@ -482,6 +590,177 @@ class Vault:
                 contact.name = _clean_name(name) or contact.name
                 self.save()
 
+    # -- groups ------------------------------------------------------------ #
+    def create_group(self, name: str, member_contact_ids: list[str]) -> Group:
+        """
+        Create a group naming a set of already-added, accepted contacts.
+
+        Raises ValueError if there are no members, too many, or any member
+        id does not name a currently-accepted contact - a group cannot
+        point at a pending request or a blocked/removed contact, since
+        there would be nobody reachable at the other end of that "member".
+        """
+        with self._lock:
+            # De-duplicate while preserving order, so a caller that
+            # accidentally lists the same contact twice does not create a
+            # group that would fan a message out to them twice.
+            seen: set[str] = set()
+            deduped = [m for m in member_contact_ids if not (m in seen or seen.add(m))]
+
+            if not deduped:
+                raise ValueError("A group needs at least one other member.")
+            if len(deduped) > MAX_GROUP_MEMBERS:
+                raise ValueError(f"A group can have at most {MAX_GROUP_MEMBERS} members.")
+            for member_id in deduped:
+                member = self.get_contact(member_id)
+                if member is None or member.status != STATUS_ACCEPTED:
+                    raise ValueError("Every group member must be an existing, accepted contact.")
+
+            group = Group(
+                id=str(uuid.uuid4()),
+                name=_clean_group_name(name) or "Group",
+                created=_now(),
+                member_contact_ids=deduped,
+            )
+            self.groups.append(group)
+            self.save()
+            return group
+
+    def get_group(self, group_id: str) -> Group | None:
+        with self._lock:
+            for g in self.groups:
+                if g.id == group_id:
+                    return g
+            return None
+
+    def sorted_groups(self) -> list[Group]:
+        with self._lock:
+            return sorted(self.groups, key=lambda g: self.group_last_activity(g), reverse=True)
+
+    def group_last_activity(self, group: Group) -> str:
+        """
+        Most recent activity timestamp for a group, for sidebar sorting.
+
+        A group has no messages list of its own (see Group's docstring -
+        every group message actually lives on a member Contact's own
+        messages list, tagged with group_id), so this scans the current
+        members' messages rather than reading a stored field.
+        """
+        with self._lock:
+            latest = group.created
+            for member_id in group.member_contact_ids:
+                member = self.get_contact(member_id)
+                if member is None:
+                    continue
+                for message in member.messages:
+                    if message.group_id == group.id and message.timestamp > latest:
+                        latest = message.timestamp
+            return latest
+
+    def group_messages(self, group: Group) -> list[Message]:
+        """
+        Every message belonging to this group, across all current members'
+        own message lists, oldest first.
+
+        Outgoing (direction "out") copies are NOT collapsed here - a group
+        send stores one Message per member (see app.py's group send path),
+        sharing a client_msg_id. Collapsing those into one displayed bubble
+        with an aggregate delivery count is display logic, so it lives in
+        app.py alongside the rest of the rendering code, not here.
+        """
+        with self._lock:
+            collected: list[Message] = []
+            for member_id in group.member_contact_ids:
+                member = self.get_contact(member_id)
+                if member is None:
+                    continue
+                collected.extend(
+                    m
+                    for m in member.messages
+                    if m.group_id == group.id and not m.is_delete_request
+                )
+            collected.sort(key=lambda m: m.timestamp)
+            return collected
+
+    def rename_group(self, group_id: str, name: str) -> None:
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is not None:
+                group.name = _clean_group_name(name) or group.name
+                self.save()
+
+    def add_group_member(self, group_id: str, contact_id: str) -> None:
+        """Add an already-accepted contact to a group. A member added this
+        way only sees *future* messages sent while they are a member -
+        there is no history to backfill from, since past messages were
+        never sent to them (see Group's docstring on there being no shared
+        roster)."""
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is None:
+                return
+            contact = self.get_contact(contact_id)
+            if contact is None or contact.status != STATUS_ACCEPTED:
+                raise ValueError("Only an existing, accepted contact can be added to a group.")
+            if contact_id in group.member_contact_ids:
+                return
+            if len(group.member_contact_ids) >= MAX_GROUP_MEMBERS:
+                raise ValueError(f"A group can have at most {MAX_GROUP_MEMBERS} members.")
+            group.member_contact_ids.append(contact_id)
+            self.save()
+
+    def remove_group_member(self, group_id: str, contact_id: str) -> None:
+        with self._lock:
+            group = self.get_group(group_id)
+            if group is not None and contact_id in group.member_contact_ids:
+                group.member_contact_ids.remove(contact_id)
+                self.save()
+
+    def delete_group(self, group_id: str) -> None:
+        """Forget the group. Past messages are left in place on each
+        member's own contact record (still tagged with the now-orphaned
+        group_id) rather than deleted, matching how removing a contact
+        does not retroactively scrub messages already exchanged."""
+        with self._lock:
+            self.groups = [g for g in self.groups if g.id != group_id]
+            self.save()
+
+    def create_group_from_invite(self, group_id: str, name: str, first_member_id: str) -> Group:
+        """
+        Auto-create a local Group the first time an incoming message arrives
+        tagged with a group id (envelope.py's "gid") this vault does not
+        already have. Since group membership is entirely local (see Group's
+        docstring - there is no server-side roster), a group-tagged message
+        from a contact you have not filed under any local group yet is,
+        practically, that contact including you in a group they set up on
+        their side; this is what lets it show up as a group conversation on
+        yours too instead of silently being dropped.
+
+        Unlike create_group(), the new Group's id is the SENDER's own gid
+        rather than a freshly generated one, so a later message tagged with
+        the same gid - from this sender, or from another member once this
+        one gets added via add_group_member - is recognized as the same
+        group instead of each starting a separate one. If a group with this
+        id already exists, it is returned unchanged (idempotent - a caller
+        does not need to check existence first).
+        """
+        with self._lock:
+            existing = self.get_group(group_id)
+            if existing is not None:
+                return existing
+            member = self.get_contact(first_member_id)
+            if member is None or member.status != STATUS_ACCEPTED:
+                raise ValueError("Only an existing, accepted contact can start a group.")
+            group = Group(
+                id=group_id,
+                name=_clean_group_name(name) or "Group",
+                created=_now(),
+                member_contact_ids=[first_member_id],
+            )
+            self.groups.append(group)
+            self.save()
+            return group
+
     # -- messages --------------------------------------------------------- #
     def add_message(
         self,
@@ -491,6 +770,13 @@ class Vault:
         delivered: bool = True,
         note: str = "",
         status: str = SENT,
+        group_id: str = "",
+        client_msg_id: str = "",
+        sender_contact_id: str = "",
+        attachment_filename: str = "",
+        attachment_mime: str = "",
+        attachment_size: int = 0,
+        is_delete_request: bool = False,
     ) -> Message | None:
         with self._lock:
             contact = self.get_contact(contact_id)
@@ -506,6 +792,13 @@ class Vault:
                 delivered=delivered,
                 note=note,
                 status=status if direction == "out" else SENT,
+                group_id=group_id,
+                client_msg_id=client_msg_id,
+                sender_contact_id=sender_contact_id,
+                attachment_filename=attachment_filename,
+                attachment_mime=attachment_mime,
+                attachment_size=attachment_size,
+                is_delete_request=is_delete_request,
             )
             contact.messages.append(message)
             self.save()
@@ -525,7 +818,11 @@ class Vault:
                 if contact.status != STATUS_ACCEPTED:
                     continue
                 for message in contact.messages:
-                    if message.direction == "out" and message.status == QUEUED:
+                    if (
+                        message.direction == "out"
+                        and message.status == QUEUED
+                        and not message.deleted
+                    ):
                         pending.append((contact, message))
             pending.sort(key=lambda pair: pair[1].timestamp)
             return pending
@@ -551,6 +848,78 @@ class Vault:
                     message.last_attempt = _now()
                     self.save()
                     return
+
+    def mark_deleted(self, contact_id: str, message_id: str) -> None:
+        """
+        Tombstone a message: scrub its displayed content but keep the row in
+        place (same id, timestamp, direction, group_id, sender_contact_id)
+        so the thread still shows *that* a message was there and was
+        deleted, in its original position, rather than a confusing gap.
+
+        This is the local half of "delete for everyone" - it removes this
+        vault's own copy of the content. The other half, for a message this
+        vault sent, is queue_delete_request() below, which notifies the
+        peer(s) so their copies are scrubbed the same way. Nothing here
+        checks *who is allowed* to delete this message - that authorization
+        decision (a message can only ever be deleted by whoever sent it) is
+        made by the caller (app.py) before this is invoked: for the sender's
+        own outgoing message that is simply "it's their own message"; for an
+        incoming "delete" envelope it is "the envelope's sender matches this
+        message's sender" (see app.py's delete-envelope handling). This
+        method only performs the mechanical scrub once that decision has
+        already been made.
+        """
+        with self._lock:
+            contact = self.get_contact(contact_id)
+            if contact is None:
+                return
+            for message in contact.messages:
+                if message.id == message_id:
+                    message.deleted = True
+                    message.body = ""
+                    message.attachment_filename = ""
+                    message.attachment_mime = ""
+                    message.attachment_size = 0
+                    message.note = ""
+                    self.save()
+                    return
+
+    def queue_delete_request(
+        self, contact_id: str, target_client_msg_id: str, group_id: str = ""
+    ) -> None:
+        """
+        Queue a "delete for everyone" notification to a single contact for a
+        message previously sent to them, identified by its shared mid (see
+        envelope.py's module docstring on "mid"/client_msg_id). Pass
+        group_id for a message that was sent as part of a group, so
+        _wire_body_for() (app.py) can tag the resulting "delete" envelope
+        with the same gid/gname a "text"/"file" envelope for that group
+        would carry - it is otherwise not used for anything (there is no
+        per-group delivery logic here; a group delete is simply one of
+        these queued per member, same as a group send is one Message per
+        member).
+
+        This deliberately reuses add_message()/queued_messages() rather than
+        a separate delivery path: the resulting row is an ordinary queued
+        outgoing Message (so DeliveryWorker's existing retry loop picks it
+        up and keeps retrying exactly like any other message until the
+        contact's onion service answers - no server, no CDN, nothing else
+        involved), just marked is_delete_request=True so app.py's
+        _wire_body_for() encodes it as a "delete" envelope instead of a
+        "text"/"file" one, and so it is never itself rendered as a chat
+        bubble or re-deleted.
+        """
+        if not target_client_msg_id:
+            return
+        self.add_message(
+            contact_id,
+            "out",
+            "",
+            status=QUEUED,
+            group_id=group_id,
+            client_msg_id=target_client_msg_id,
+            is_delete_request=True,
+        )
 
     def queued_count(self) -> int:
         with self._lock:
@@ -831,6 +1200,11 @@ def _clean_name(name: str) -> str:
     attacker- or user-supplied name would still bloat the vault file and
     the contact-list UI."""
     return name.strip()[:MAX_CONTACT_NAME_LENGTH]
+
+
+def _clean_group_name(name: str) -> str:
+    """Same bound as _clean_name, for group names."""
+    return name.strip()[:MAX_GROUP_NAME_LENGTH]
 
 
 def _generate_signing_keypair() -> tuple[str, str]:

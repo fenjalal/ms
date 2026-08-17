@@ -119,7 +119,7 @@ def stylesheet(p: Palette) -> str:
         background-color: {p.surface};
         color: {p.text};
         border: 1px solid {p.border};
-        border-radius: 6px;
+        border-radius: 10px;
         padding: 6px;
         selection-background-color: {p.accent};
         selection-color: {p.accent_text};
@@ -133,9 +133,12 @@ def stylesheet(p: Palette) -> str:
         color: {p.text_muted};
     }}
 
+    /* Roomier rows with a round-avatar icon (see app.py's _avatar_pixmap) -
+    a conversation-list row, not a dense menu entry. */
     QListWidget::item {{
-        padding: 8px 6px;
-        border-radius: 4px;
+        padding: 9px 8px;
+        margin: 1px 2px;
+        border-radius: 10px;
     }}
     QListWidget::item:selected {{
         background-color: {p.accent};
@@ -150,7 +153,7 @@ def stylesheet(p: Palette) -> str:
         background-color: {p.surface};
         color: {p.text};
         border: 1px solid {p.border};
-        border-radius: 6px;
+        border-radius: 9px;
         padding: 7px 14px;
         min-height: 18px;
     }}
@@ -198,6 +201,47 @@ def stylesheet(p: Palette) -> str:
     QPushButton#danger:hover {{
         background-color: {p.error};
         color: #ffffff;
+    }}
+
+    /* The round, icon-only composer send button - see app.py's
+    _build_conversation_panel. Fixed circular size regardless of content,
+    so the icon always sits centred in a perfect circle rather than a
+    button that grows/shrinks with its (nonexistent) label. */
+    QPushButton#sendButton {{
+        background-color: {p.accent};
+        border: none;
+        border-radius: 20px;
+        min-width: 40px;
+        max-width: 40px;
+        min-height: 40px;
+        max-height: 40px;
+        padding: 0;
+    }}
+    QPushButton#sendButton:hover {{
+        background-color: {p.accent_hover};
+    }}
+    QPushButton#sendButton:pressed {{
+        background-color: {p.accent_pressed};
+    }}
+    QPushButton#sendButton:disabled {{
+        background-color: {p.border};
+    }}
+
+    /* The composer's "Attach..." button reads as a quiet icon action, not
+    a competing call-to-action next to the round send button. */
+    QPushButton#attachButton {{
+        border: none;
+        background-color: transparent;
+        border-radius: 18px;
+        min-width: 36px;
+        max-width: 36px;
+        min-height: 36px;
+        max-height: 36px;
+        padding: 0;
+        font-size: 17px;
+    }}
+    QPushButton#attachButton:hover {{
+        background-color: {p.border};
     }}
 
     QLabel {{

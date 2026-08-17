@@ -12,16 +12,29 @@ messages or be compelled to hand over records.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
 import logging
 import os
+import mimetypes
 import sys
 import threading
+import uuid
 from datetime import datetime
 
 import segno
-from PySide6.QtCore import QBuffer, QByteArray, Qt, QThread, Signal
-from PySide6.QtGui import QFont, QGuiApplication, QIcon, QPixmap, QTransform
+from PySide6.QtCore import QBuffer, QByteArray, QSize, Qt, QThread, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QPainter,
+    QPixmap,
+    QTransform,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -51,6 +64,7 @@ from PySide6.QtWidgets import (
 
 import bundle as bundle_mod
 import crypto
+import envelope
 import i18n
 import paths
 import theme
@@ -134,6 +148,63 @@ _CONNECTION_STATES = {
     STATE_OFFLINE: ("Offline", "error"),
     STATE_RECONNECTING: ("Reconnecting…", "warn"),
 }
+
+# --------------------------------------------------------------------------- #
+# Conversation list item kind (contact vs. group), stored alongside the id
+# already carried in Qt.UserRole so the sidebar can hold both in one merged,
+# recency-sorted list.
+# --------------------------------------------------------------------------- #
+_ITEM_KIND_ROLE = Qt.UserRole + 1
+_KIND_CONTACT = "contact"
+_KIND_GROUP = "group"
+
+
+def _wire_body_for(vault: "vault_mod.Vault", message: "vault_mod.Message") -> str:
+    """
+    The exact plaintext to hand to transport.send_message for this outgoing
+    message, whether it is being sent for the first time or retried by
+    DeliveryWorker.
+
+    Verbatim message.body for an ordinary 1:1 text message - unchanged from
+    before group/file support existed, the common and most-tested path. A
+    group tag and/or a file attachment needs a fresh envelope.py envelope
+    instead, since transport.py itself has no notion of either, and a
+    retried send needs that context exactly as much as the original send
+    did (a receiver that only saw the raw text on retry would lose the
+    group/file framing entirely).
+
+    A message with is_delete_request=True is not a displayed message at all
+    - it is the queued notification half of "delete for everyone" (see
+    vault.Vault.queue_delete_request()) - so it always encodes as a "delete"
+    control envelope naming the message it wants deleted (its client_msg_id,
+    not its own local id), never as "text"/"file".
+    """
+    if message.is_delete_request:
+        gname = ""
+        if message.group_id:
+            group = vault.get_group(message.group_id)
+            gname = group.name if group is not None else ""
+        return envelope.encode_delete(message.client_msg_id, gid=message.group_id, gname=gname)
+    if message.attachment_filename:
+        try:
+            data = base64.b64decode(message.body)
+        except Exception:
+            data = b""
+        gname = ""
+        if message.group_id:
+            group = vault.get_group(message.group_id)
+            gname = group.name if group is not None else ""
+        return envelope.encode_file(
+            message.attachment_filename, message.attachment_mime, data,
+            gid=message.group_id, gname=gname, mid=message.client_msg_id,
+        )
+    if message.group_id:
+        group = vault.get_group(message.group_id)
+        gname = group.name if group is not None else ""
+        return envelope.encode_text(
+            message.body, gid=message.group_id, gname=gname, mid=message.client_msg_id
+        )
+    return envelope.encode_text(message.body, mid=message.client_msg_id)
 
 
 def _on_transport_event(kind: str, onion: str) -> None:
@@ -274,6 +345,67 @@ class SendWorker(QThread):
         except Exception as exc:  # noqa: BLE001
             _logger.exception("Unexpected error sending a message")
             self.done.emit(False, safe_error_text(exc, self.tr("An unexpected error occurred while sending.")))
+
+
+class GroupSendWorker(QThread):
+    """
+    Delivers one group message: an individually Box-encrypted, individually
+    Tor-delivered send to every current member, sequentially.
+
+    There is no fan-out at the network layer to parallelize (each send is
+    its own Tor circuit through a shared SOCKS proxy) - sequential keeps
+    this simple and avoids hammering the local Tor SOCKS port with several
+    connections at once for what, in realistic group sizes, is still a
+    handful of sends. A member who is offline or unreachable fails that one
+    send only; per_result is emitted for every member regardless, so the
+    caller can save a QUEUED Message for the ones that failed exactly like
+    a 1:1 send does, and DeliveryWorker's existing retry sweep (see
+    _wire_body_for) picks those back up the same way it retries any other
+    queued message.
+    """
+
+    # member_contact_id, success, error
+    per_result = Signal(str, bool, str)
+    finished_all = Signal()
+
+    def __init__(
+        self, members: list[tuple[str, str, str]], wire_body: str,
+        my_private: bytes, my_public_b64: str, my_onion: str, socks_port: int,
+    ) -> None:
+        """members: list of (contact_id, onion, public_key_b64) - resolved
+        by the caller before starting the thread, so this class never
+        touches the Vault itself (same "workers do network I/O, the UI
+        thread owns vault state" split every other worker here follows)."""
+        super().__init__()
+        self._members = members
+        self._wire_body = wire_body
+        self._my_private = my_private
+        self._my_public_b64 = my_public_b64
+        self._my_onion = my_onion
+        self._socks_port = socks_port
+
+    def run(self) -> None:
+        for contact_id, onion, public_key_b64 in self._members:
+            try:
+                transport.send_message(
+                    onion=onion,
+                    their_public_b64=public_key_b64,
+                    body=self._wire_body,
+                    my_private=self._my_private,
+                    my_public_b64=self._my_public_b64,
+                    my_onion=self._my_onion,
+                    socks_port=self._socks_port,
+                )
+                self.per_result.emit(contact_id, True, "")
+            except transport.TransportError as exc:
+                self.per_result.emit(contact_id, False, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                _logger.exception("Unexpected error sending a group message to one member")
+                self.per_result.emit(
+                    contact_id, False,
+                    safe_error_text(exc, self.tr("An unexpected error occurred while sending.")),
+                )
+        self.finished_all.emit()
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +850,12 @@ class SettingsDialog(QDialog):
         self.vault = vault
         self.setWindowTitle(self.tr("Settings"))
         self.setMinimumWidth(420)
+        # Set by _on_restart_clicked; MainWindow._on_settings checks this
+        # after exec() returns and performs the actual restart - a QDialog
+        # closing itself is not the right place to tear down Tor/the vault
+        # and re-exec the process, that has to happen in MainWindow, which
+        # owns all of that state (see MainWindow._restart_app).
+        self.restart_requested = False
 
         layout = QVBoxLayout(self)
 
@@ -750,6 +888,12 @@ class SettingsDialog(QDialog):
         self.restart_notice.setWordWrap(True)
         self.restart_notice.setVisible(False)
         layout.addWidget(self.restart_notice)
+
+        self.restart_button = QPushButton(self.tr("Restart Now"))
+        self.restart_button.setCursor(Qt.PointingHandCursor)
+        self.restart_button.setVisible(False)
+        self.restart_button.clicked.connect(self._on_restart_clicked)
+        layout.addWidget(self.restart_button)
 
         # --- Who can reach me ---
         policy_title = QLabel(self.tr("Who can reach me"))
@@ -788,6 +932,16 @@ class SettingsDialog(QDialog):
         # effect on the next launch, so the notice's job is just to say
         # "this needs a restart," not to track whether it truly differs.
         self.restart_notice.setVisible(True)
+        self.restart_button.setVisible(True)
+
+    def _on_restart_clicked(self) -> None:
+        self.restart_requested = True
+        # accept(), not a bare close - Close still means "keep the setting,
+        # restart later on your own" (the button box below), Restart Now
+        # means "apply it right now." Either way the language choice itself
+        # is already persisted by _on_language_changed, so this is purely
+        # about when the running process picks it up.
+        self.accept()
 
 
 class ShareDialog(QDialog):
@@ -855,6 +1009,75 @@ class ShareDialog(QDialog):
     def _copy_bundle(self, bundle_text: str) -> None:
         QGuiApplication.clipboard().setText(bundle_text)
         QMessageBox.information(self, self.tr("Copied"), self.tr("Contact bundle copied."))
+
+
+class NewGroupDialog(QDialog):
+    """
+    Create a group by naming it and checking off members from the
+    already-added, accepted contacts list.
+
+    There is nothing to reach out to here (unlike Add Contact) - a group
+    can only be built from people already in the address book, since
+    membership is local-only (see vault.Group's docstring) and a message
+    still has to be individually Tor-delivered to each member's own onion
+    address, which this app only ever has for an existing contact.
+    """
+
+    def __init__(self, contacts: list[vault_mod.Contact], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("New Group"))
+        self.resize(380, 440)
+        self.setSizeGripEnabled(True)
+        self.group_name = ""
+        self.selected_contact_ids: list[str] = []
+        self._contacts = contacts
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText(self.tr("e.g. Friends"))
+        form.addRow(self.tr("Group name"), self.name_input)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel(self.tr("Members:")))
+        self.member_list = QListWidget()
+        for contact in contacts:
+            item = QListWidgetItem(contact.name)
+            item.setData(Qt.UserRole, contact.id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.member_list.addItem(item)
+        layout.addWidget(self.member_list, stretch=1)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("danger-text")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        name = self.name_input.text().strip()
+        if not name:
+            self.error_label.setText(self.tr("Enter a name for the group."))
+            return
+
+        selected = []
+        for row in range(self.member_list.count()):
+            item = self.member_list.item(row)
+            if item.checkState() == Qt.Checked:
+                selected.append(item.data(Qt.UserRole))
+        if not selected:
+            self.error_label.setText(self.tr("Select at least one member."))
+            return
+
+        self.group_name = name
+        self.selected_contact_ids = selected
+        self.accept()
 
 
 class DeliveryWorker(QThread):
@@ -946,7 +1169,7 @@ class DeliveryWorker(QThread):
                 transport.send_message(
                     onion=contact.onion,
                     their_public_b64=contact.public_key,
-                    body=message.body,
+                    body=_wire_body_for(self._vault, message),
                     my_private=self._vault.private_key_raw(),
                     my_public_b64=identity.public_key,
                     my_onion=identity.onion,
@@ -984,12 +1207,27 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.vault = vault
         self._active_contact_id: str | None = None
+        # Non-None exactly when the sidebar selection is a group rather
+        # than a contact - at most one of _active_contact_id /
+        # _active_group_id is set at a time (see _on_contact_selected).
+        self._active_group_id: str | None = None
+        self._group_send_worker: "GroupSendWorker | None" = None
+        self._group_send_message_ids: dict[str, str] = {}
         self._send_worker: SendWorker | None = None
         self._tor_worker: TorStartWorker | None = None
         self.monitor: HealthMonitor | None = None
         self.delivery: DeliveryWorker | None = None
         self._self_test: SelfTestWorker | None = None
         self._pending_body = ""
+        self._pending_client_msg_id = ""
+        self._pending_file_message_id: str | None = None
+        # The contact a message was actually sent to, captured at send time.
+        # _active_contact_id can change while a send is still in flight (the
+        # user is free to click another contact while waiting on the network
+        # thread) - using _active_contact_id in _on_send_done instead of this
+        # would file the send result under whichever contact happens to be
+        # selected when the worker finishes, not the one it was sent to.
+        self._pending_contact_id: str | None = None
 
         self.tor = tor_service.TorManager(data_dir=os.path.join(paths.data_dir(), "tor-data"))
         self.server: MessageServer | None = None
@@ -1030,7 +1268,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_conversation_panel())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([300, 740])
+        splitter.setSizes([340, 760])
         root.addWidget(splitter, stretch=1)
 
         # --- Status bar: colored dot + text + manual check ---
@@ -1099,23 +1337,27 @@ class MainWindow(QMainWindow):
         self.my_status_label = QLabel()
         layout.addWidget(self.my_status_label)
 
+        # Short labels (the full description lives in each button's
+        # tooltip) so all three comfortably fit the sidebar's width without
+        # clipping - "Share Contact...", "Keys...", "Settings..." routinely
+        # overflowed a narrow sidebar and got visually truncated.
         button_row = QHBoxLayout()
-        self.share_button = QPushButton(self.tr("Share Contact..."))
+        self.share_button = QPushButton(self.tr("Share"))
         self.share_button.setToolTip(
             self.tr(
-                "QR code and copyable bundle a contact can scan or paste to add "
-                "you - never your onion address in the clear."
+                "Share Contact: QR code and copyable bundle a contact can scan or "
+                "paste to add you - never your onion address in the clear."
             )
         )
         self.share_button.clicked.connect(self._on_share_contact)
         button_row.addWidget(self.share_button)
 
-        identity_button = QPushButton(self.tr("Keys..."))
+        identity_button = QPushButton(self.tr("Keys"))
         identity_button.setToolTip(self.tr("Fingerprint, backup, and identity"))
         identity_button.clicked.connect(self._on_identity)
         button_row.addWidget(identity_button)
 
-        settings_button = QPushButton(self.tr("Settings..."))
+        settings_button = QPushButton(self.tr("Settings"))
         settings_button.setToolTip(self.tr("Language and who can reach you"))
         settings_button.clicked.connect(self._on_settings)
         button_row.addWidget(settings_button)
@@ -1135,6 +1377,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(contacts_title)
 
         self.contact_list = QListWidget()
+        self.contact_list.setIconSize(QSize(36, 36))
         self.contact_list.currentItemChanged.connect(self._on_contact_selected)
         self.contact_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.contact_list.customContextMenuRequested.connect(self._on_contact_menu)
@@ -1144,6 +1387,10 @@ class MainWindow(QMainWindow):
         add_button = QPushButton(self.tr("Add"))
         add_button.clicked.connect(self._on_add_contact)
         row.addWidget(add_button)
+
+        new_group_button = QPushButton(self.tr("New Group"))
+        new_group_button.clicked.connect(self._on_new_group)
+        row.addWidget(new_group_button)
 
         remove_button = QPushButton(self.tr("Remove"))
         remove_button.clicked.connect(self._on_remove_contact)
@@ -1158,16 +1405,37 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 12, 12, 12)
         layout.setSpacing(8)
 
+        header_row = QHBoxLayout()
+        header_row.setSpacing(10)
+
+        self.conversation_avatar = QLabel()
+        self.conversation_avatar.setFixedSize(34, 34)
+        self.conversation_avatar.setVisible(False)
+        header_row.addWidget(self.conversation_avatar)
+
         self.conversation_header = QLabel(self.tr("Select or add a contact"))
         header_font = QFont()
         header_font.setBold(True)
         header_font.setPointSize(11)
         self.conversation_header.setFont(header_font)
-        layout.addWidget(self.conversation_header)
+        header_row.addWidget(self.conversation_header, stretch=1)
+
+        layout.addLayout(header_row)
 
         self.thread_view = QTextBrowser()
         self.thread_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Links inside the thread are never real navigation (there is no
+        # browser here) - just the "Save As..." attachment affordance (see
+        # _attachment_html/_on_thread_link_clicked) - so autonomous opening
+        # is turned off in favor of handling every click ourselves.
+        self.thread_view.setOpenLinks(False)
+        self.thread_view.anchorClicked.connect(self._on_thread_link_clicked)
         layout.addWidget(self.thread_view, stretch=3)
+        # message id -> Message, refreshed every _render_conversation() call,
+        # so _on_thread_link_clicked can resolve an "attach:<id>" href back
+        # to the real Message (and its full attachment bytes) without
+        # having to re-search every contact/group on each click.
+        self._rendered_messages: dict[str, vault_mod.Message] = {}
 
         # Shown only for pending requests.
         self.request_bar = QWidget()
@@ -1195,8 +1463,36 @@ class MainWindow(QMainWindow):
         self.message_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.message_input, stretch=1)
 
-        self.send_button = QPushButton(self.tr(" Send"))
-        self.send_button.setObjectName("primary")   # styled as the main action
+        composer_row = QHBoxLayout()
+
+        # Icon-only, like the round send button - the tooltip carries the
+        # actual description rather than a wide "Attach..." label. Not
+        # wrapped in self.tr(): same reason as the lock emoji in
+        # _refresh_identity_display - pyside6-lupdate corrupts non-BMP
+        # (astral-plane) characters like this paperclip when extracting
+        # from Python source (U+1F4CE gets truncated to U+F4CE, a private-
+        # use codepoint, in the generated .ts), and a glyph needs no
+        # per-language translation anyway.
+        self.attach_button = QPushButton("\U0001F4CE")
+        self.attach_button.setObjectName("attachButton")
+        self.attach_button.setCursor(Qt.PointingHandCursor)
+        self.attach_button.setToolTip(
+            i18n.fmt(
+                self.tr("Send a file or image (up to %(mb)s MB)"),
+                mb=envelope.MAX_FILE_BYTES // (1024 * 1024),
+            )
+        )
+        self.attach_button.clicked.connect(self._on_send_file)
+        composer_row.addWidget(self.attach_button)
+
+        # A round, icon-only send button on the trailing edge - the
+        # familiar "paper plane in a circle" shape most chat apps use -
+        # rather than a wide rectangular button with a text label. Falls
+        # back to a labeled rectangular button (objectName "primary", the
+        # same styling every other call-to-action button in the app uses)
+        # if the icon asset cannot be found for any reason, so the control
+        # stays usable/discoverable either way.
+        self.send_button = QPushButton()
         self.send_button.setCursor(Qt.PointingHandCursor)
         send_icon_path = brand_image_path("veilwire-send.png")
         if send_icon_path:
@@ -1209,9 +1505,20 @@ class MainWindow(QMainWindow):
                 # file (keeps the "brand assets are never duplicated/
                 # modified" discipline from the branding work intact).
                 send_icon = send_icon.transformed(QTransform().scale(-1, 1))
+            self.send_button.setObjectName("sendButton")
             self.send_button.setIcon(QIcon(send_icon))
+            self.send_button.setIconSize(QSize(20, 20))
+            self.send_button.setToolTip(self.tr("Send"))
+            self._send_button_has_icon = True
+        else:
+            self.send_button.setObjectName("primary")
+            self.send_button.setText(self.tr(" Send"))
+            self._send_button_has_icon = False
         self.send_button.clicked.connect(self._on_send)
-        layout.addWidget(self.send_button)
+        composer_row.addStretch(1)
+        composer_row.addWidget(self.send_button)
+
+        layout.addLayout(composer_row)
 
         self._set_composer_enabled(False)
         return panel
@@ -1287,13 +1594,21 @@ class MainWindow(QMainWindow):
         self.contact_list.blockSignals(True)
         self.contact_list.clear()
 
+        # One combined, recency-sorted list of contacts and groups, like an
+        # ordinary messenger's conversation list - built as (sort_key, kind,
+        # id, label, tooltip) tuples first so the two kinds can be merged
+        # and sorted together rather than shown as two separate blocks.
+        rows: list[tuple[str, str, str, str, str]] = []
+
         for contact in self.vault.sorted_contacts():
             if contact.status == vault_mod.STATUS_BLOCKED:
                 continue  # blocked contacts stay hidden
 
             count = len(contact.messages)
+            tooltip = ""
             if contact.status == vault_mod.STATUS_PENDING:
                 label = self.tr("[request] %(name)s") % {"name": contact.name}
+                tooltip = self.tr("Wants to message you. Select to accept or block.")
             else:
                 marker = "\u2713 " if contact.verified else ""
                 # Presence: filled dot online, hollow offline, nothing if unknown.
@@ -1308,21 +1623,50 @@ class MainWindow(QMainWindow):
                     suffix += self.tr("  [%(queued)s queued]") % {"queued": queued}
                 label = f"{presence}{marker}{contact.name}{suffix}"
 
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, contact.id)
-            if contact.status == vault_mod.STATUS_PENDING:
-                item.setToolTip(self.tr("Wants to message you. Select to accept or block."))
+            rows.append((contact.last_activity, _KIND_CONTACT, contact.id, label, tooltip, contact.name))
+
+        for group in self.vault.groups:
+            messages = self.vault.group_messages(group)
+            queued = sum(
+                1 for m in messages
+                if m.direction == "out" and m.status == vault_mod.QUEUED and not m.sender_contact_id
+            )
+            member_count = len(group.member_contact_ids)
+            # Kept short - "N members" plus a separate message count made
+            # this row overflow the sidebar's width for anything but a
+            # tiny group; the message count is still one tap away (open
+            # the conversation) so dropping it from the row loses nothing
+            # essential, while "queued" is worth keeping since it is the
+            # one state that needs the user's attention from the sidebar.
+            suffix = self.tr("  [%(queued)s queued]") % {"queued": queued} if queued else ""
+            label = self.tr("\u25c8 %(name)s \u00b7 %(members)s members%(suffix)s") % {
+                "name": group.name, "members": member_count, "suffix": suffix,
+            }
+            rows.append((
+                self.vault.group_last_activity(group), _KIND_GROUP, group.id, label,
+                self.tr("Group of %(members)s") % {"members": member_count}, group.name,
+            ))
+
+        rows.sort(key=lambda r: r[0], reverse=True)
+
+        for _sort_key, kind, item_id, label, tooltip, avatar_name in rows:
+            item = QListWidgetItem(_avatar_icon(avatar_name), label)
+            item.setData(Qt.UserRole, item_id)
+            item.setData(_ITEM_KIND_ROLE, kind)
+            if tooltip:
+                item.setToolTip(tooltip)
             self.contact_list.addItem(item)
 
         self.contact_list.blockSignals(False)
 
-        target = select_id or self._active_contact_id
+        target = select_id or self._active_contact_id or self._active_group_id
         if target and self._select_contact(target):
             return
         if self.contact_list.count():
             self.contact_list.setCurrentRow(0)
         else:
             self._active_contact_id = None
+            self._active_group_id = None
             self._render_conversation(None)
 
     def _select_contact(self, contact_id: str) -> bool:
@@ -1335,10 +1679,19 @@ class MainWindow(QMainWindow):
     def _on_contact_selected(self, current: QListWidgetItem | None, _previous) -> None:
         if current is None:
             self._active_contact_id = None
+            self._active_group_id = None
             self._render_conversation(None)
             return
-        self._active_contact_id = current.data(Qt.UserRole)
-        self._render_conversation(self.vault.get_contact(self._active_contact_id))
+        item_id = current.data(Qt.UserRole)
+        kind = current.data(_ITEM_KIND_ROLE)
+        if kind == _KIND_GROUP:
+            self._active_contact_id = None
+            self._active_group_id = item_id
+            self._render_conversation(None, group=self.vault.get_group(item_id))
+        else:
+            self._active_contact_id = item_id
+            self._active_group_id = None
+            self._render_conversation(self.vault.get_contact(self._active_contact_id))
 
     def _on_add_contact(self) -> None:
         text, ok = QInputDialog.getText(
@@ -1381,6 +1734,11 @@ class MainWindow(QMainWindow):
         item = self.contact_list.currentItem()
         if item is None:
             return
+
+        if item.data(_ITEM_KIND_ROLE) == _KIND_GROUP:
+            self._on_delete_group(item.data(Qt.UserRole))
+            return
+
         contact = self.vault.get_contact(item.data(Qt.UserRole))
         if contact is None:
             return
@@ -1404,6 +1762,102 @@ class MainWindow(QMainWindow):
         self.vault.delete_contact(contact.id)
         self._active_contact_id = None
         self._reload_contacts()
+
+    def _on_delete_group(self, group_id: str) -> None:
+        group = self.vault.get_group(group_id)
+        if group is None:
+            return
+        confirm = QMessageBox.question(
+            self,
+            self.tr("Delete Group"),
+            i18n.fmt(
+                self.tr(
+                    "Delete the group “%(name)s”?\n\n"
+                    "This only removes it from your own device - other members keep "
+                    "their own copy of the group and its messages."
+                ),
+                name=escape_html(group.name),
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.vault.delete_group(group_id)
+        if self._active_group_id == group_id:
+            self._active_group_id = None
+        self._reload_contacts()
+
+    def _on_new_group(self) -> None:
+        accepted = self.vault.accepted_contacts()
+        if not accepted:
+            QMessageBox.information(
+                self, self.tr("No contacts yet"),
+                self.tr("Add at least one contact before creating a group - group members "
+                        "have to already be contacts you have added and verified."),
+            )
+            return
+
+        dialog = NewGroupDialog(accepted, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        try:
+            group = self.vault.create_group(dialog.group_name, dialog.selected_contact_ids)
+        except ValueError as exc:
+            QMessageBox.warning(self, self.tr("Could not create group"), str(exc))
+            return
+
+        self._reload_contacts(select_id=group.id)
+
+    def _on_group_menu(self, group_id: str, position) -> None:
+        group = self.vault.get_group(group_id)
+        if group is None:
+            return
+
+        menu = QMenu(self)
+        rename = menu.addAction(self.tr("Rename group"))
+        manage = menu.addAction(self.tr("Add/remove members"))
+        delete = menu.addAction(self.tr("Delete group"))
+        chosen = menu.exec(self.contact_list.mapToGlobal(position))
+
+        if chosen == rename:
+            name, ok = QInputDialog.getText(
+                self, self.tr("Rename group"), self.tr("New name:"), text=group.name
+            )
+            if ok and name.strip():
+                self.vault.rename_group(group.id, name)
+                self._reload_contacts(select_id=group.id)
+        elif chosen == manage:
+            self._on_manage_group_members(group)
+        elif chosen == delete:
+            self._on_delete_group(group.id)
+
+    def _on_manage_group_members(self, group: vault_mod.Group) -> None:
+        accepted = self.vault.accepted_contacts()
+        dialog = NewGroupDialog(accepted, self)
+        dialog.setWindowTitle(self.tr("Add/Remove Members"))
+        dialog.name_input.setText(group.name)
+        for row in range(dialog.member_list.count()):
+            item = dialog.member_list.item(row)
+            if item.data(Qt.UserRole) in group.member_contact_ids:
+                item.setCheckState(Qt.Checked)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.vault.rename_group(group.id, dialog.group_name)
+        new_members = set(dialog.selected_contact_ids)
+        current_members = set(group.member_contact_ids)
+        for contact_id in new_members - current_members:
+            try:
+                self.vault.add_group_member(group.id, contact_id)
+            except ValueError as exc:
+                QMessageBox.warning(self, self.tr("Could not add member"), str(exc))
+        for contact_id in current_members - new_members:
+            self.vault.remove_group_member(group.id, contact_id)
+
+        self._reload_contacts(select_id=group.id)
 
     def _on_accept_request(self) -> None:
         if self._active_contact_id is None:
@@ -1466,7 +1920,10 @@ class MainWindow(QMainWindow):
         self._refresh_identity_display()
 
     def _on_settings(self) -> None:
-        SettingsDialog(self.vault, self).exec()
+        dialog = SettingsDialog(self.vault, self)
+        dialog.exec()
+        if dialog.restart_requested:
+            self._restart_app()
 
     def _refresh_identity_display(self) -> None:
         identity = self.vault.identity
@@ -1491,6 +1948,11 @@ class MainWindow(QMainWindow):
         item = self.contact_list.itemAt(position)
         if item is None:
             return
+
+        if item.data(_ITEM_KIND_ROLE) == _KIND_GROUP:
+            self._on_group_menu(item.data(Qt.UserRole), position)
+            return
+
         contact = self.vault.get_contact(item.data(Qt.UserRole))
         if contact is None:
             return
@@ -1537,8 +1999,17 @@ class MainWindow(QMainWindow):
             self._on_remove_contact()
 
     # -- Conversation ------------------------------------------------------- #
-    def _render_conversation(self, contact: vault_mod.Contact | None) -> None:
+    def _render_conversation(
+        self, contact: vault_mod.Contact | None, group: vault_mod.Group | None = None,
+    ) -> None:
+        self._rendered_messages = {}
+
+        if group is not None:
+            self._render_group_conversation(group)
+            return
+
         if contact is None:
+            self.conversation_avatar.setVisible(False)
             self.conversation_header.setText(self.tr("Select or add a contact"))
             empty_image = f"<div style='text-align:center;'>{_brand_image_html('veilwire-chat.png', 160)}</div>"
             self.thread_view.setHtml(
@@ -1558,6 +2029,7 @@ class MainWindow(QMainWindow):
         # onion is an internal transport detail, not a normal user-facing
         # identity field, anywhere in the UI.
         if contact.status == vault_mod.STATUS_PENDING:
+            self.conversation_avatar.setVisible(False)
             if _is_endpoint_change_warning(contact.name):
                 self.conversation_header.setText(self.tr("\u26a0 Identity / Endpoint Changed"))
                 self.thread_view.setHtml(
@@ -1611,6 +2083,8 @@ class MainWindow(QMainWindow):
         self.conversation_header.setText(
             f"{escape_html(contact.name)}{verified_mark}{presence_text}"
         )
+        self.conversation_avatar.setPixmap(_avatar_pixmap(contact.name, 34))
+        self.conversation_avatar.setVisible(True)
         self._set_composer_enabled(self.tor.service is not None)
 
         if not contact.messages:
@@ -1629,21 +2103,274 @@ class MainWindow(QMainWindow):
             return
 
         p = self.palette_colors
-        blocks = [
-            render_bubble(msg, contact.name, p)
-            for msg in sorted(contact.messages, key=lambda m: m.timestamp)
-        ]
+        # is_delete_request rows are the queued "delete for everyone"
+        # notification itself (see vault.Vault.queue_delete_request()), not
+        # a displayed message - never rendered as a bubble.
+        ordered = sorted(
+            (m for m in contact.messages if not m.is_delete_request),
+            key=lambda m: m.timestamp,
+        )
+        for msg in ordered:
+            self._rendered_messages[msg.id] = msg
+        blocks = [render_bubble(msg, contact.name, p) for msg in ordered]
 
         self.thread_view.setHtml("".join(blocks))
         bar = self.thread_view.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def _render_group_conversation(self, group: vault_mod.Group) -> None:
+        p = self.palette_colors
+        self.request_bar.setVisible(False)
+
+        member_names = [
+            c.name for c in (self.vault.get_contact(mid) for mid in group.member_contact_ids)
+            if c is not None
+        ]
+        # self.tr("no members") computed as its own statement, not inline
+        # inside the f-string below - see the comment above the group note
+        # translations in this same method for why (pyside6-lupdate does
+        # not reliably extract a .tr(...) call nested inside an f-string's
+        # {...} expression).
+        no_members_text = self.tr("no members")
+        joined_members = escape_html(", ".join(member_names)) or no_members_text
+        self.conversation_header.setText(
+            i18n.fmt(
+                self.tr("◈ %(name)s"), name=escape_html(group.name),
+            ) + f"  ·  {joined_members}"
+        )
+        self.conversation_avatar.setPixmap(_avatar_pixmap(group.name, 34))
+        self.conversation_avatar.setVisible(True)
+        self._set_composer_enabled(self.tor.service is not None and bool(group.member_contact_ids))
+
+        messages = self.vault.group_messages(group)
+        if not messages:
+            self.thread_view.setHtml(
+                f"<p style='color:{p.text_muted};'>"
+                + self.tr(
+                    "No messages yet. Every member needs the app running at the "
+                    "same time as you for a group message to reach them."
+                )
+                + "</p>"
+            )
+            return
+
+        # Outgoing messages are stored as one Message per member (see
+        # vault.Message.client_msg_id's docstring) - collapse each set of
+        # sibling copies into a single bubble with an aggregate delivery
+        # count, rather than showing the same text N times.
+        blocks: list[tuple[str, str]] = []  # (timestamp, html), for a stable final sort
+        seen_client_ids: set[str] = set()
+
+        for msg in messages:
+            if msg.direction == "out":
+                cid = msg.client_msg_id
+                if cid and cid in seen_client_ids:
+                    continue
+                copies = [m for m in messages if m.client_msg_id == cid] if cid else [msg]
+                seen_client_ids.add(cid)
+                sent_count = sum(1 for m in copies if m.status == vault_mod.SENT)
+                total = len(copies)
+                # self.tr()/i18n.fmt() here, not the free-function i18n.tr()/
+                # trf() - self is available (this is a MainWindow method), so
+                # this follows the same convention every other in-class
+                # translated string in this file uses (see i18n.py's
+                # trf()/fmt() docstrings for why fmt(self.tr(...), ...) is
+                # the right pairing inside a class). This also happens to
+                # matter functionally, not just stylistically: trf()'s own
+                # keyword-only `n` parameter (the Qt numerus selector) would
+                # swallow a caller's `n=total` meant for %(n)s substitution
+                # instead of passing it through to %-formatting - fmt() has
+                # no such reserved name and does not have this trap.
+                #
+                # Each self.tr(...) call is its own statement, computed
+                # BEFORE the f-string that uses it, never inline inside an
+                # f-string's {...} expression - pyside6-lupdate's Python
+                # string extraction does not reliably find a call nested
+                # that way (verified empirically: it silently extracts
+                # nothing, leaving the string untranslated in every
+                # language forever with no error anywhere). See
+                # _attachment_html's save_as_text comment for the same rule
+                # applied to a free function.
+                if sent_count == total:
+                    delivered_text = self.tr("Delivered")
+                    note = (
+                        f"<div style='color:{p.text_muted};font-size:11px;'>"
+                        f"{delivered_text}</div>"
+                    )
+                elif sent_count == 0:
+                    waiting_text = i18n.fmt(self.tr("Waiting for %(n)s member(s)…"), n=total)
+                    note = (
+                        f"<div style='color:{p.warn};font-size:11px;'>"
+                        f"{waiting_text}</div>"
+                    )
+                else:
+                    partial_text = i18n.fmt(
+                        self.tr("Delivered to %(sent)s of %(total)s"),
+                        sent=sent_count, total=total,
+                    )
+                    note = (
+                        f"<div style='color:{p.warn};font-size:11px;'>"
+                        f"{partial_text}"
+                        f"</div>"
+                    )
+                self._rendered_messages[msg.id] = msg
+                blocks.append((msg.timestamp, render_bubble(msg, group.name, p, note_override=note)))
+            else:
+                sender = self.vault.get_contact(msg.sender_contact_id)
+                sender_name = sender.name if sender is not None else self.tr("Unknown member")
+                self._rendered_messages[msg.id] = msg
+                blocks.append((msg.timestamp, render_bubble(msg, sender_name, p)))
+
+        blocks.sort(key=lambda pair: pair[0])
+        self.thread_view.setHtml("".join(html for _ts, html in blocks))
+        bar = self.thread_view.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _on_thread_link_clicked(self, url) -> None:
+        """
+        Handles a click on a link inside a message bubble - either
+        "attach:<id>" (Save As..., see _attachment_html) or "delmsg:<id>"
+        (Delete, see render_bubble) - the only two kinds of link the thread
+        view ever contains (setOpenLinks(False) above stops Qt from doing
+        anything with either on its own).
+        """
+        href = url.toString()
+        if href.startswith("delmsg:"):
+            message_id = href[len("delmsg:"):]
+            msg = self._rendered_messages.get(message_id)
+            if msg is not None:
+                self._on_delete_message(msg)
+            return
+        if not href.startswith("attach:"):
+            return
+        message_id = href[len("attach:"):]
+        msg = self._rendered_messages.get(message_id)
+        if msg is None or not msg.attachment_filename:
+            return
+
+        try:
+            data = base64.b64decode(msg.body)
+        except Exception:
+            QMessageBox.warning(self, self.tr("Could not save file"), self.tr("The attachment is corrupted."))
+            return
+
+        target_path, _filter = QFileDialog.getSaveFileName(
+            self, self.tr("Save Attachment"), msg.attachment_filename,
+        )
+        if not target_path:
+            return
+        try:
+            with open(target_path, "wb") as f:
+                f.write(data)
+            os.chmod(target_path, 0o600)
+        except OSError as exc:
+            _logger.exception("Could not save attachment")
+            QMessageBox.warning(
+                self, self.tr("Could not save file"),
+                safe_error_text(exc, self.tr("Could not write the file to that location.")),
+            )
+
+    def _on_delete_message(self, msg: vault_mod.Message) -> None:
+        """
+        "Delete for everyone" for a message the local user sent (only ever
+        reachable via render_bubble's "Delete" link, which is only ever
+        shown on the user's own outgoing bubbles - see its docstring - so
+        msg.direction == "out" here in every real UI path; checked again
+        below anyway since this also doubles as the one place that could
+        enforce it if that ever changed).
+
+        Two things happen, both already-hardened, existing machinery rather
+        than a new delivery mechanism:
+
+        1. mark_deleted() scrubs this vault's own copy (or copies, for a
+           group message - see below) right away, locally.
+        2. queue_delete_request() queues a "delete" envelope (see
+           envelope.py) to whoever originally received the message, reusing
+           the exact same queued-Message/DeliveryWorker retry path every
+           other outgoing message already goes through - no separate
+           mechanism, no server, no CDN: if the recipient is offline right
+           now, this keeps retrying exactly like a queued text message would,
+           entirely over Tor to their hidden service, until it gets through.
+
+        Deleting still applies regardless of whether the original message
+        was ever confirmed delivered - undoing it locally and queuing the
+        notification does not depend on that message's own delivery state
+        at all.
+
+        A group message was originally stored as one Message per member,
+        sharing client_msg_id (see vault.Message's docstring) - all of those
+        sibling copies are found and deleted/notified together here, so
+        "delete for everyone" in a group really means everyone, not just
+        the one member row the clicked bubble happened to represent.
+        """
+        if msg.direction != "out" or not msg.client_msg_id:
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            self.tr("Delete message"),
+            self.tr(
+                "Delete this message for everyone? This cannot be undone, and "
+                "removes it from the other side too - whether or not it has been "
+                "delivered yet."
+            ),
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        if msg.group_id:
+            # Find every sibling per-member copy of this same outgoing group
+            # message (see vault.Message.client_msg_id's docstring) by
+            # scanning every contact's own messages list directly, rather
+            # than only the group's *current* members - this still finds
+            # (and deletes/notifies) a copy sent to a member who has since
+            # left the group, whose message row lives on unaffected by that.
+            seen_ids: set[str] = set()
+            copies = []
+            for contact in self.vault.contacts:
+                for m in contact.messages:
+                    if (
+                        m.direction == "out"
+                        and m.client_msg_id == msg.client_msg_id
+                        and m.id not in seen_ids
+                    ):
+                        copies.append(m)
+                        seen_ids.add(m.id)
+            for copy in copies:
+                self.vault.mark_deleted(copy.contact_id, copy.id)
+                self.vault.queue_delete_request(
+                    copy.contact_id, copy.client_msg_id, group_id=msg.group_id
+                )
+        else:
+            self.vault.mark_deleted(msg.contact_id, msg.id)
+            self.vault.queue_delete_request(msg.contact_id, msg.client_msg_id)
+
+        if self.delivery is not None:
+            self.delivery.wake()
+
+        self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+        if msg.group_id:
+            group = self.vault.get_group(msg.group_id)
+            if group is not None and self._active_group_id == msg.group_id:
+                self._render_conversation(None, group=group)
+        else:
+            contact = self.vault.get_contact(msg.contact_id)
+            if contact is not None and self._active_contact_id == msg.contact_id:
+                self._render_conversation(contact)
+
     def _set_composer_enabled(self, enabled: bool) -> None:
         self.message_input.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
+        self.attach_button.setEnabled(enabled)
 
     # -- Sending ------------------------------------------------------------ #
     def _on_send(self) -> None:
+        if self._active_group_id is not None:
+            self._on_send_group_text()
+            return
+
         if self._send_worker is not None and self._send_worker.isRunning():
             return
         if self._active_contact_id is None:
@@ -1666,14 +2393,27 @@ class MainWindow(QMainWindow):
         identity = self.vault.identity
         assert identity is not None
 
+        # A fresh shared id for this message (see envelope.py's module
+        # docstring on "mid"), sent on the wire and stored locally as this
+        # Message's client_msg_id, so a later "delete for everyone" (see
+        # _on_delete_message) has something stable to name - independent of
+        # this message's local vault.Message.id, which the recipient's copy
+        # will never share.
+        client_msg_id = str(uuid.uuid4())
+
         self._pending_body = body
+        self._pending_client_msg_id = client_msg_id
+        self._pending_contact_id = contact.id
         self.send_button.setDisabled(True)
-        self.send_button.setText(self.tr("Sending…"))
+        self.send_button.setToolTip(self.tr("Sending…"))
+        # Also block a file send starting concurrently and racing this one
+        # over the shared self._send_worker/self._pending_contact_id fields.
+        self.attach_button.setDisabled(True)
 
         self._send_worker = SendWorker(
             onion=contact.onion,
             their_public_b64=contact.public_key,
-            body=body,
+            body=envelope.encode_text(body, mid=client_msg_id),
             my_private=self.vault.private_key_raw(),
             my_public_b64=identity.public_key,
             my_onion=identity.onion,
@@ -1685,21 +2425,34 @@ class MainWindow(QMainWindow):
 
     def _on_send_done(self, success: bool, error: str) -> None:
         self.send_button.setDisabled(False)
-        self.send_button.setText(self.tr(" Send"))
+        if self._send_button_has_icon:
+            self.send_button.setToolTip(self.tr("Send"))
+        else:
+            self.send_button.setText(self.tr(" Send"))
+        self.attach_button.setDisabled(False)
 
-        if self._active_contact_id:
+        # Always the contact this specific send was actually addressed to -
+        # never self._active_contact_id, which may have changed if the user
+        # switched to a different conversation while this send was still in
+        # flight on the network thread. Using the live selection here would
+        # file the message (and its delivered/queued outcome) under whatever
+        # contact happens to be on screen when the worker finishes, not the
+        # one it was sent to.
+        sent_to_id = self._pending_contact_id
+        if sent_to_id:
             # A failed send is queued, not lost. The delivery worker keeps
             # retrying until the contact's onion service answers.
             self.vault.add_message(
-                self._active_contact_id,
+                sent_to_id,
                 direction="out",
                 body=self._pending_body,
                 delivered=success,
                 note="" if success else error,
                 status=vault_mod.SENT if success else vault_mod.QUEUED,
+                client_msg_id=self._pending_client_msg_id,
             )
-
-        self.message_input.clear()
+        self._pending_contact_id = None
+        self._pending_client_msg_id = ""
 
         # No status-bar announcement here - the message itself appears in
         # the thread below with its own delivery state (see render_bubble),
@@ -1708,13 +2461,372 @@ class MainWindow(QMainWindow):
         if not success and self.delivery is not None:
             self.delivery.wake()
 
+        # Reload the sidebar regardless (the sent-to contact's last-activity
+        # time changed and may need to re-sort) but keep whatever contact is
+        # currently selected - it may no longer be sent_to_id.
         self._reload_contacts(select_id=self._active_contact_id)
-        self._render_conversation(self.vault.get_contact(self._active_contact_id or ""))
+
+        # Only touch the composer and the visible conversation if the user
+        # is still looking at the conversation this message was sent to.
+        # Otherwise this would wipe out a draft the user has since started
+        # typing to someone else, or flash their conversation to a message
+        # that was not sent to that person.
+        if self._active_contact_id == sent_to_id:
+            self.message_input.clear()
+            self._render_conversation(self.vault.get_contact(sent_to_id))
 
     def _release_send_worker(self) -> None:
         if self._send_worker is not None:
             self._send_worker.deleteLater()
             self._send_worker = None
+
+    # -- Group sending -------------------------------------------------------- #
+    def _on_send_group_text(self) -> None:
+        if self._group_send_worker is not None and self._group_send_worker.isRunning():
+            return
+        if self._active_group_id is None:
+            return
+        group = self.vault.get_group(self._active_group_id)
+        if group is None:
+            return
+
+        body = self.message_input.toPlainText().strip()
+        if not body:
+            return
+
+        if self.tor.service is None:
+            QMessageBox.warning(
+                self, self.tr("Not ready"), self.tr("Still getting ready. Try again in a moment.")
+            )
+            return
+        if not group.member_contact_ids:
+            QMessageBox.warning(
+                self, self.tr("No members"), self.tr("This group has no members to send to.")
+            )
+            return
+
+        self._start_group_send(group, text_body=body)
+
+    def _start_group_send(
+        self, group: vault_mod.Group, *, text_body: str = "",
+        file_path: str = "", file_data: bytes = b"", file_mime: str = "",
+    ) -> None:
+        """
+        Common path for both a typed group message and a group file/image
+        send.
+
+        Creates one QUEUED outgoing Message per member up front (so
+        vault.Vault.queued_messages()/DeliveryWorker's existing, already-
+        hardened retry sweep picks up any member this attempt fails for,
+        with zero changes to that code - see _wire_body_for), then starts
+        one GroupSendWorker to actually attempt delivery to everyone.
+        """
+        identity = self.vault.identity
+        assert identity is not None
+        is_file = bool(file_path)
+
+        members: list[tuple[str, str, str]] = []
+        for member_id in group.member_contact_ids:
+            member = self.vault.get_contact(member_id)
+            if member is not None:
+                members.append((member.id, member.onion, member.public_key))
+        if not members:
+            return
+
+        client_msg_id = str(uuid.uuid4())
+
+        # Build the wire envelope first (it sanitizes the filename - see
+        # envelope.py), then decode it straight back so the locally-stored
+        # Message rows use the exact same sanitized filename/mime that will
+        # actually go out on the wire, rather than re-deriving them
+        # separately and risking the two falling out of sync.
+        if is_file:
+            wire_body = envelope.encode_file(
+                os.path.basename(file_path), file_mime, file_data,
+                gid=group.id, gname=group.name, mid=client_msg_id,
+            )
+            sent = envelope.decode(wire_body)
+            stored_body = sent.body  # already base64, matches envelope's own encoding
+            attachment_filename, attachment_mime, attachment_size = sent.filename, sent.mime, sent.size
+        else:
+            wire_body = envelope.encode_text(
+                text_body, gid=group.id, gname=group.name, mid=client_msg_id
+            )
+            stored_body = text_body
+            attachment_filename = attachment_mime = ""
+            attachment_size = 0
+
+        message_ids: dict[str, str] = {}
+        for member_id, _onion, _pub in members:
+            msg = self.vault.add_message(
+                member_id, direction="out", body=stored_body, delivered=False,
+                status=vault_mod.QUEUED, group_id=group.id, client_msg_id=client_msg_id,
+                attachment_filename=attachment_filename, attachment_mime=attachment_mime,
+                attachment_size=attachment_size,
+            )
+            if msg is not None:
+                message_ids[member_id] = msg.id
+        self._group_send_message_ids = message_ids
+
+        self.message_input.clear()
+        self._reload_contacts(select_id=self._active_group_id)
+        if self._active_group_id == group.id:
+            self._render_conversation(None, group=group)
+
+        self.send_button.setDisabled(True)
+        self.attach_button.setDisabled(True)
+        self._group_send_worker = GroupSendWorker(
+            members=members,
+            wire_body=wire_body,
+            my_private=self.vault.private_key_raw(),
+            my_public_b64=identity.public_key,
+            my_onion=identity.onion,
+            socks_port=self.tor.socks_port,
+        )
+        self._group_send_worker.per_result.connect(self._on_group_send_result)
+        self._group_send_worker.finished_all.connect(self._on_group_send_finished)
+        self._group_send_worker.finished.connect(self._release_group_send_worker)
+        self._group_send_worker.start()
+
+    def _on_group_send_result(self, contact_id: str, success: bool, error: str) -> None:
+        message_id = self._group_send_message_ids.get(contact_id)
+        if message_id is None:
+            return
+        self.vault.mark_message(
+            contact_id, message_id, vault_mod.SENT if success else vault_mod.QUEUED,
+            "" if success else error,
+        )
+
+    def _on_group_send_finished(self) -> None:
+        self.send_button.setDisabled(False)
+        self.attach_button.setDisabled(False)
+        self._group_send_message_ids = {}
+
+        # Any per-member failure just recorded above is now an ordinary
+        # QUEUED message like any other - wake the existing delivery
+        # worker so it starts retrying without waiting for its next
+        # scheduled sweep.
+        if self.delivery is not None:
+            self.delivery.wake()
+
+        self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+        if self._active_group_id:
+            group = self.vault.get_group(self._active_group_id)
+            if group is not None:
+                self._render_conversation(None, group=group)
+
+    def _release_group_send_worker(self) -> None:
+        if self._group_send_worker is not None:
+            self._group_send_worker.deleteLater()
+            self._group_send_worker = None
+
+    # -- File / image sending ------------------------------------------------ #
+    def _on_send_file(self) -> None:
+        """Attach... button: works for either a 1:1 contact or a group,
+        whichever is currently selected."""
+        target_group: vault_mod.Group | None = None
+        target_contact: vault_mod.Contact | None = None
+
+        if self._active_group_id is not None:
+            target_group = self.vault.get_group(self._active_group_id)
+            if target_group is None:
+                return
+            if not target_group.member_contact_ids:
+                QMessageBox.warning(
+                    self, self.tr("No members"), self.tr("This group has no members to send to.")
+                )
+                return
+            if self._group_send_worker is not None and self._group_send_worker.isRunning():
+                return
+        else:
+            if self._active_contact_id is None:
+                return
+            target_contact = self.vault.get_contact(self._active_contact_id)
+            if target_contact is None:
+                return
+            if self._send_worker is not None and self._send_worker.isRunning():
+                return
+
+        if self.tor.service is None:
+            QMessageBox.warning(
+                self, self.tr("Not ready"), self.tr("Still getting ready. Try again in a moment.")
+            )
+            return
+
+        path, _filter = QFileDialog.getOpenFileName(self, self.tr("Send File"))
+        if not path:
+            return
+
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            _logger.exception("Could not stat file to send")
+            QMessageBox.warning(
+                self, self.tr("Could not read file"),
+                safe_error_text(exc, self.tr("Could not read that file.")),
+            )
+            return
+        if size > envelope.MAX_FILE_BYTES:
+            QMessageBox.warning(
+                self, self.tr("File is too large"),
+                i18n.fmt(
+                    self.tr("Files are limited to %(mb)s MB."),
+                    mb=envelope.MAX_FILE_BYTES // (1024 * 1024),
+                ),
+            )
+            return
+
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            _logger.exception("Could not read file to send")
+            QMessageBox.warning(
+                self, self.tr("Could not read file"),
+                safe_error_text(exc, self.tr("Could not read that file.")),
+            )
+            return
+
+        mime, _encoding = mimetypes.guess_type(path)
+        mime = mime or "application/octet-stream"
+
+        if mime.startswith("image/"):
+            original_mime = mime
+            data, mime = self._resolve_image_send_choice(data, mime)
+            if data is None:
+                return  # user cancelled
+            if mime != original_mime:
+                # Recompressed to JPEG - rename so the extension the
+                # recipient sees actually matches the bytes being sent,
+                # rather than e.g. still claiming ".png" for JPEG content.
+                base, _ext = os.path.splitext(os.path.basename(path))
+                path = f"{base}.jpg"
+
+        if target_group is not None:
+            self._start_group_send(target_group, file_path=path, file_data=data, file_mime=mime)
+        elif target_contact is not None:
+            self._start_contact_file_send(target_contact, path, data, mime)
+
+    def _resolve_image_send_choice(
+        self, data: bytes, mime: str
+    ) -> tuple[bytes | None, str]:
+        """
+        Ask the user whether to send an image attachment as-is or
+        re-encoded (see _recompress_image_bytes) before it goes out.
+
+        Framed for the user as a security choice, not a quality/size one:
+        a file that is merely disguised as an image (or an image file with
+        something extra appended or embedded in it) is a real way to smuggle
+        an unwanted payload to a contact, and re-encoding strips all of that
+        - at the cost of re-compressing the picture itself and stripping its
+        metadata (including anything like embedded location data, which some
+        people want gone anyway). Sending the original stays available for
+        when fidelity matters and the file is trusted (e.g. a photo the user
+        just took themselves).
+
+        Returns (None, "") if the user cancelled the send entirely - the
+        caller must treat that as "do not send anything". Returns the
+        original (data, mime) unchanged if the user chose "Send Original",
+        or (recompressed bytes, "image/jpeg") if they chose "Send
+        Compressed".
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle(self.tr("Send image"))
+        box.setText(
+            self.tr(
+                "Send this image as-is, or re-encoded first?\n\n"
+                "Re-encoding fully decodes the image and rebuilds it from "
+                "scratch, discarding anything hidden in the original file "
+                "(and its metadata, such as location data) - recommended "
+                "unless you need the exact original file, e.g. for quality "
+                "or provenance."
+            )
+        )
+        compressed_button = box.addButton(self.tr("Send Compressed"), QMessageBox.AcceptRole)
+        original_button = box.addButton(self.tr("Send Original"), QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(compressed_button)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is original_button:
+            return data, mime
+        if clicked is not compressed_button:
+            return None, ""  # Cancel, or the dialog was dismissed
+
+        recompressed = _recompress_image_bytes(data)
+        if recompressed is None:
+            QMessageBox.warning(
+                self,
+                self.tr("Could not read image"),
+                self.tr(
+                    "This file could not be decoded as an image, so it cannot be "
+                    "safely re-encoded. It may not actually be an image, or may be "
+                    "corrupted - sending it as-is is not recommended."
+                ),
+            )
+            return None, ""
+        return recompressed, "image/jpeg"
+
+    def _start_contact_file_send(
+        self, contact: vault_mod.Contact, file_path: str, file_data: bytes, file_mime: str,
+    ) -> None:
+        client_msg_id = str(uuid.uuid4())
+        wire_body = envelope.encode_file(
+            os.path.basename(file_path), file_mime, file_data, mid=client_msg_id,
+        )
+        sent = envelope.decode(wire_body)  # sanitized filename/mime, matches what is actually sent
+
+        msg = self.vault.add_message(
+            contact.id, direction="out", body=sent.body, delivered=False, status=vault_mod.QUEUED,
+            attachment_filename=sent.filename, attachment_mime=sent.mime, attachment_size=sent.size,
+            client_msg_id=client_msg_id,
+        )
+        self._pending_file_message_id = msg.id if msg is not None else None
+        self._pending_contact_id = contact.id
+
+        self._reload_contacts(select_id=self._active_contact_id)
+        if self._active_contact_id == contact.id:
+            self._render_conversation(self.vault.get_contact(contact.id))
+
+        identity = self.vault.identity
+        assert identity is not None
+        self.send_button.setDisabled(True)
+        self.attach_button.setDisabled(True)
+        self._send_worker = SendWorker(
+            onion=contact.onion,
+            their_public_b64=contact.public_key,
+            body=wire_body,
+            my_private=self.vault.private_key_raw(),
+            my_public_b64=identity.public_key,
+            my_onion=identity.onion,
+            socks_port=self.tor.socks_port,
+        )
+        self._send_worker.done.connect(self._on_file_send_done)
+        self._send_worker.finished.connect(self._release_send_worker)
+        self._send_worker.start()
+
+    def _on_file_send_done(self, success: bool, error: str) -> None:
+        self.send_button.setDisabled(False)
+        self.attach_button.setDisabled(False)
+
+        message_id = self._pending_file_message_id
+        sent_to_id = self._pending_contact_id
+        self._pending_file_message_id = None
+        self._pending_contact_id = None
+
+        if sent_to_id and message_id:
+            self.vault.mark_message(
+                sent_to_id, message_id, vault_mod.SENT if success else vault_mod.QUEUED,
+                "" if success else error,
+            )
+        if not success and self.delivery is not None:
+            self.delivery.wake()
+
+        self._reload_contacts(select_id=self._active_contact_id)
+        if self._active_contact_id == sent_to_id:
+            self._render_conversation(self.vault.get_contact(sent_to_id))
 
     # -- Receiving ---------------------------------------------------------- #
     def _on_incoming(self, message: transport.IncomingMessage) -> None:
@@ -1729,22 +2841,134 @@ class MainWindow(QMainWindow):
         if contact.status == vault_mod.STATUS_BLOCKED:
             return  # Blocked after acceptance but before delivery.
 
-        self.vault.add_message(contact.id, direction="in", body=body)
-        self._reload_contacts(select_id=self._active_contact_id)
-
         if contact.status == vault_mod.STATUS_PENDING:
-            # contact.name carries any impersonation warning _add_pending
-            # attached (see vault.py). The sidebar's [request]-prefixed row
-            # (already rendered by _reload_contacts above) is the surface
-            # for this - no separate status-bar announcement, same as any
-            # other pending-request arrival.
+            # Unchanged from before group/file support existed: a
+            # stranger's first message is stored as plain text on the
+            # pending request record. Envelope/group/file framing is only
+            # trusted once the user has actually accepted this sender as a
+            # contact - a pending sender does not get to auto-join a group
+            # or land a "file" bubble in the UI before that decision is
+            # made (contact.name already carries any impersonation warning
+            # _add_pending attached - see vault.py).
+            self.vault.add_message(contact.id, direction="in", body=body)
+            self._reload_contacts(select_id=self._active_contact_id)
             return
 
-        if self._active_contact_id == contact.id:
+        try:
+            env = envelope.decode(body)
+        except envelope.EnvelopeError:
+            # Shaped like an envelope but fails validation (e.g. corrupted
+            # or hostile base64/JSON) - dropped rather than shown as a
+            # garbled bubble. Genuinely malformed input elsewhere in the
+            # pipeline is already dropped silently the same way (see
+            # transport.py); this is that same rule applied one layer up.
+            _logger.warning("Discarding a malformed message envelope")
+            return
+
+        if env.kind == envelope.KIND_DELETE:
+            group = self._apply_delete_envelope(contact, env)
+            self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+            if group is not None:
+                if self._active_group_id == group.id:
+                    self._render_conversation(None, group=group)
+            elif self._active_contact_id == contact.id:
+                self._render_conversation(self.vault.get_contact(contact.id))
+            return
+
+        if env.gid:
+            group = self._file_incoming_group_message(contact, env)
+        else:
+            group = None
+            if env.kind == envelope.KIND_FILE:
+                self.vault.add_message(
+                    contact.id, direction="in", body=env.body,
+                    attachment_filename=env.filename, attachment_mime=env.mime,
+                    attachment_size=env.size, client_msg_id=env.mid,
+                )
+            else:
+                self.vault.add_message(
+                    contact.id, direction="in", body=env.body, client_msg_id=env.mid,
+                )
+
+        self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+
+        if group is not None:
+            if self._active_group_id == group.id:
+                self._render_conversation(None, group=group)
+        elif self._active_contact_id == contact.id:
             # The message appears in the open thread below - that is the
             # notification, exactly like a normal messenger. No redundant
             # banner needed.
             self._render_conversation(self.vault.get_contact(contact.id))
+
+    def _apply_delete_envelope(
+        self, contact: vault_mod.Contact, env: envelope.Envelope,
+    ) -> vault_mod.Group | None:
+        """
+        Handle an incoming "delete" control envelope (see envelope.py):
+        find and tombstone (vault.Vault.mark_deleted()) the local copy of
+        the message it names, if we have one.
+
+        Authorization is enforced structurally here, not by an extra check:
+        `contact` is already the specific contact this envelope's Box was
+        proven to be encrypted by (see transport.py/_on_message_arrived's
+        find_by_public_key lookup, above) - so only scanning *that
+        contact's own* `messages` list, filtered to `direction == "in"`,
+        makes it impossible for this to ever touch a message some other
+        contact sent, or a message the local user sent themselves. That is
+        true for a 1:1 message and for a group message alike, because an
+        incoming group message is stored on its actual sender's own contact
+        record (see _file_incoming_group_message above) - so "the contact
+        this envelope came from" and "the sender to check the deleted
+        message's sender_contact_id against" are simply the same check.
+        A delete_mid this contact never actually sent us matches nothing
+        and is silently a no-op, same as any other message id that does not
+        exist.
+        """
+        if not env.delete_mid:
+            return None
+        for message in contact.messages:
+            if message.direction != "in" or message.client_msg_id != env.delete_mid:
+                continue
+            if env.gid and message.group_id != env.gid:
+                continue
+            self.vault.mark_deleted(contact.id, message.id)
+            if message.group_id:
+                return self.vault.get_group(message.group_id)
+            return None
+        return None
+
+    def _file_incoming_group_message(
+        self, sender: vault_mod.Contact, env: envelope.Envelope,
+    ) -> vault_mod.Group:
+        """Store an incoming group-tagged message, auto-creating (or
+        growing the membership of) the local Group it belongs to. See
+        vault.Vault.create_group_from_invite for why this is safe to do
+        automatically: it only ever adds an already-accepted contact you
+        chose to trust, never a stranger."""
+        group = self.vault.get_group(env.gid)
+        if group is None:
+            group = self.vault.create_group_from_invite(
+                env.gid, env.gname or self.tr("Group"), sender.id,
+            )
+        elif sender.id not in group.member_contact_ids:
+            try:
+                self.vault.add_group_member(group.id, sender.id)
+            except ValueError:
+                pass  # group is already at MAX_GROUP_MEMBERS; message is still filed below
+
+        if env.kind == envelope.KIND_FILE:
+            self.vault.add_message(
+                sender.id, direction="in", body=env.body, group_id=group.id,
+                sender_contact_id=sender.id, attachment_filename=env.filename,
+                attachment_mime=env.mime, attachment_size=env.size, client_msg_id=env.mid,
+            )
+        else:
+            self.vault.add_message(
+                sender.id, direction="in", body=env.body, group_id=group.id,
+                sender_contact_id=sender.id, client_msg_id=env.mid,
+            )
+        return group
 
     # -- Misc --------------------------------------------------------------- #
     def _on_share_contact(self) -> None:
@@ -1839,7 +3063,18 @@ class MainWindow(QMainWindow):
             self.vault.set_onion(self.tor.service.onion, self.tor.service.private_key)
             self._refresh_identity_display()
 
-    def closeEvent(self, event) -> None:
+    def _shutdown_network(self) -> None:
+        """
+        Everything that must happen before this process can safely exit (or
+        re-exec itself - see _restart_app): cancel a still-bootstrapping
+        Tor startup, stop every background thread, tear down the local
+        listener and Tor controller, and lock the vault.
+
+        Factored out of closeEvent so a restart can run the exact same
+        shutdown sequence a normal quit does - a restart that skipped any
+        of this could leave an orphaned Tor process behind, or hand off to
+        the new process while the old one still holds the vault file.
+        """
         # Cancel a still-bootstrapping Tor startup *before* waiting on its
         # thread and tearing the controller down - otherwise a close during
         # startup can leave TorStartWorker blocked in its own bootstrap
@@ -1857,20 +3092,218 @@ class MainWindow(QMainWindow):
             self._self_test.wait(3000)
         if self._send_worker is not None and self._send_worker.isRunning():
             self._send_worker.wait(5000)
+        if self._group_send_worker is not None and self._group_send_worker.isRunning():
+            self._group_send_worker.wait(5000)
         if self._tor_worker is not None and self._tor_worker.isRunning():
             self._tor_worker.wait(5000)
         if self.server is not None:
             self.server.stop()
         self.tor.stop()
         self.vault.lock()
+
+    def closeEvent(self, event) -> None:
+        self._shutdown_network()
         super().closeEvent(event)
+
+    def _restart_app(self) -> None:
+        """
+        Relaunch the application in a fresh process - used after a language
+        change (see SettingsDialog), which only takes effect on the next
+        launch since Qt's translators are installed once at startup.
+
+        Shuts everything down exactly as a normal quit does (_shutdown_network),
+        then re-executes the same interpreter with the same arguments
+        (os.execv replaces this process image in place - there is no
+        intermediate state where neither the old nor the new instance is
+        running, and no window ever briefly appears half-closed). This
+        works the same way whether launched via `python3 app.py`, the
+        installed `veilwire` launcher (sys.executable is always the actual
+        running interpreter, never the shell launcher script itself), or
+        an AppImage's bundled venv - none of that matters here since
+        sys.executable/sys.argv already describe exactly how *this*
+        process was started.
+        """
+        _logger.info("Restarting to apply the new language...")
+        self._shutdown_network()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 
-def render_bubble(msg, contact_name: str, p) -> str:
+# A fixed set of pleasant, high-contrast-on-white fill colours for the
+# round initial avatars in the sidebar and conversation header - picked by
+# hashing the display name so the same contact/group keeps the same
+# colour across restarts with nothing to store for it, the same
+# "recognize people by consistent colour" cue Telegram/Signal-style
+# messengers use in place of an actual photo (this app never has one -
+# there is no profile picture feature, and there will not be one: a
+# photo is exactly the kind of identifying metadata a peer-to-peer,
+# no-server, hide-your-IP messenger should not be encouraging people to
+# exchange in the clear-ish contact bundle).
+_AVATAR_COLORS = (
+    "#e17076", "#eda86c", "#a695e7", "#7bc862", "#6ec9cb",
+    "#65aadd", "#ee7aae", "#faa774", "#60c7a5", "#8e85ee",
+)
+
+
+def _avatar_pixmap(name: str, size: int = 36) -> QPixmap:
+    """
+    A round, coloured avatar bearing the name's first letter - decorative
+    only, generated on the fly from text already in the vault (a contact's
+    or group's own display name), never uploaded, stored as an image, or
+    exchanged with anyone. Used as the QListWidgetItem icon in the sidebar
+    (native icon+text items keep the existing QListWidget::item:selected
+    styling "for free" - no custom item widget/selection-repaint logic
+    needed) and in the conversation header.
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+
+    letter = (name.strip()[:1] or "?").upper()
+    digest = hashlib.sha256((name or "?").encode("utf-8")).digest()
+    color = _AVATAR_COLORS[digest[0] % len(_AVATAR_COLORS)]
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(0, 0, size, size)
+
+    font = QFont()
+    font.setPixelSize(max(10, int(size * 0.44)))
+    font.setBold(True)
+    painter.setFont(font)
+    painter.setPen(QColor("#ffffff"))
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, letter)
+    painter.end()
+
+    return pixmap
+
+
+_avatar_icon_cache: dict[str, QIcon] = {}
+
+
+def _avatar_icon(name: str) -> QIcon:
+    """Cached QIcon wrapper around _avatar_pixmap - the sidebar rebuilds
+    every row on every reload (a new message, a presence change, ...), so
+    this avoids repainting the same handful of contacts'/groups' avatars
+    from scratch dozens of times a session."""
+    icon = _avatar_icon_cache.get(name)
+    if icon is None:
+        icon = QIcon(_avatar_pixmap(name))
+        _avatar_icon_cache[name] = icon
+    return icon
+
+
+def _format_file_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _recompress_image_bytes(data: bytes) -> bytes | None:
+    """
+    Fully decode an image and re-encode it as a fresh JPEG, discarding
+    everything about the original file except the decoded pixels.
+
+    This is offered as the "compressed" choice when sending an image (see
+    MainWindow._resolve_image_send_choice) as a real, if partial, mitigation
+    against a booby-trapped image file: a file that merely *claims* to be a
+    JPEG/PNG/etc. but is actually something else (an exploit targeting a
+    different parser, a polyglot file, an embedded script, extra bytes
+    appended after the real image data) will either fail this decode step
+    outright, or - if it does decode - has none of that surrounding data
+    survive the round trip, because only the decoded pixel grid is used to
+    build the new file; nothing from the original byte stream is copied
+    through. It also strips any embedded metadata (EXIF, GPS location,
+    thumbnails, comments).
+
+    Honest caveat, not overstated: this does not make receiving images from
+    an untrusted contact perfectly safe - a flaw in the image *decoder*
+    itself (Qt's, on the sending side; the recipient's own viewer, on the
+    receiving side) is a different, deeper class of risk that recompression
+    cannot fix, and Qt's QImage decoder is exactly what is used here, on
+    both this app's own send path and (implicitly) whatever eventually
+    displays the image. What it does concretely rule out is any of the
+    *original file's raw bytes* - beyond the decoded picture itself -
+    reaching the recipient at all.
+
+    Returns None if the data could not be decoded as an image at all -
+    the caller treats that as a signal worth surfacing to the user rather
+    than silently sending the original bytes.
+    """
+    image = QImage()
+    if not image.loadFromData(data):
+        return None
+    buffer = QBuffer()
+    buffer.open(QBuffer.WriteOnly)
+    # JPEG has no metadata/text-chunk fields of the kind PNG allows, and
+    # re-encoding to it is a lossy full pixel round-trip - simple and
+    # sufficient for this feature's purpose (a photo/image attachment),
+    # not a general lossless-format-preserving converter.
+    if not image.save(buffer, "JPEG", 85):
+        return None
+    return bytes(buffer.data())
+
+
+def _attachment_html(msg, p) -> str:
+    """
+    HTML for a file/image attachment carried on a message (see
+    Message.attachment_filename in vault.py and envelope.py's KIND_FILE).
+
+    Images get an inline preview decoded straight from the base64 already
+    held in msg.body (no extra decode step elsewhere); anything else gets a
+    generic file glyph. Either way a "Save As..." link is included - an
+    anchor with a stable `attach:<message id>` href that
+    MainWindow._on_thread_link_clicked resolves back to the real Message to
+    write out, rather than embedding the bytes in the href itself.
+    """
+    if not getattr(msg, "attachment_filename", ""):
+        return ""
+
+    filename = escape_html(msg.attachment_filename)
+    size_text = _format_file_size(getattr(msg, "attachment_size", 0))
+    # Translated first, into a plain local variable, rather than calling
+    # i18n.tr() directly inside the f-string's {...} expression below:
+    # pyside6-lupdate's Python string extraction does not reliably find a
+    # single-quoted i18n.tr('...') call nested inside a double-quoted
+    # f-string (verified empirically - it silently extracts nothing, so the
+    # string would stay untranslated in every language forever with no
+    # error anywhere). Computing it as a separate statement first sidesteps
+    # that entirely, matching how every OTHER free-function translation in
+    # this file that lupdate does pick up (e.g. render_bubble's `who =
+    # i18n.tr("You") if ...`) is already written: never inside an f-string.
+    save_as_text = i18n.tr("Save As…")
+    save_link = (
+        f"<a href='attach:{escape_html(msg.id)}' "
+        f"style='color:{p.accent};text-decoration:none;'>{save_as_text}</a>"
+    )
+
+    preview = ""
+    mime = getattr(msg, "attachment_mime", "")
+    if mime.startswith("image/"):
+        preview = (
+            f"<div style='margin-bottom:4px;'>"
+            f"<img src='data:{escape_html(mime)};base64,{msg.body}' "
+            f"width='220' style='border-radius:6px;'></div>"
+        )
+
+    return (
+        f"<div style='margin-top:4px;padding:6px;border:1px solid {p.border};"
+        f"border-radius:6px;'>"
+        f"{preview}"
+        f"<div style='color:{p.text};font-size:12px;'>\U0001F4CE {filename}</div>"
+        f"<div style='color:{p.text_muted};font-size:11px;'>{size_text} &middot; {save_link}</div>"
+        f"</div>"
+    )
+
+
+def render_bubble(msg, contact_name: str, p, note_override: str | None = None) -> str:
     """
     Build the HTML for one message bubble.
 
@@ -1879,6 +3312,16 @@ def render_bubble(msg, contact_name: str, p) -> str:
     inspecting the widget afterwards cannot prove the text colour was set -
     but that pairing is exactly what stops messages being invisible on a dark
     desktop, so it has to be verifiable.
+
+    `contact_name` is who to attribute an *incoming* message to - for a 1:1
+    thread that's always the same contact, but a group thread passes the
+    actual sender's name per-message (see MainWindow._render_conversation),
+    so this function does not need its own notion of "which conversation".
+
+    `note_override`, when given, replaces the normal delivered/queued note
+    entirely. Used for a collapsed group-outgoing bubble, whose delivery
+    state is an aggregate across several per-member sends rather than the
+    single status field an ordinary Message carries.
     """
     outgoing = msg.direction == "out"
     who = i18n.tr("You") if outgoing else escape_html(contact_name)
@@ -1887,7 +3330,41 @@ def render_bubble(msg, contact_name: str, p) -> str:
     background = p.bubble_out_bg if outgoing else p.bubble_in_bg
     foreground = p.bubble_out_text if outgoing else p.bubble_in_text
 
-    body = escape_html(msg.body).replace("\n", "<br>")
+    deleted = bool(getattr(msg, "deleted", False))
+    is_attachment = bool(getattr(msg, "attachment_filename", ""))
+    if deleted:
+        # Tombstone: content is gone (vault.Vault.mark_deleted() already
+        # scrubbed body/attachment_* - this is just how it's displayed),
+        # but the bubble stays in place so the thread still shows that a
+        # message was here rather than a silent gap or reordering.
+        #
+        # Translated into a local variable first, not inline inside the
+        # f-string below - see _attachment_html's save_as_text comment for
+        # why: pyside6-lupdate does not extract a single-quoted i18n.tr(...)
+        # call nested inside an f-string's {...} expression.
+        deleted_text = i18n.tr("This message was deleted")
+        body = (
+            f"<span style='color:{p.text_muted};font-style:italic;'>"
+            f"{deleted_text}</span>"
+        )
+    elif is_attachment:
+        body = _attachment_html(msg, p)
+    else:
+        body = escape_html(msg.body).replace("\n", "<br>")
+
+    # A "Delete" link is offered only on the sender's own, still-intact,
+    # outgoing bubbles - never on an incoming message (see
+    # MainWindow._on_delete_message: only the original sender may ever
+    # delete a message, matching how the receiving side independently
+    # verifies this over the wire, in vault.py/app.py's KIND_DELETE
+    # handling, not just in this display-only check here).
+    delete_link = ""
+    if outgoing and not deleted and getattr(msg, "client_msg_id", ""):
+        delete_text = i18n.tr("Delete")  # see save_as_text's comment above on why this is not inline
+        delete_link = (
+            f" &middot; <a href='delmsg:{escape_html(msg.id)}' "
+            f"style='color:{p.text_muted};text-decoration:none;'>{delete_text}</a>"
+        )
 
     # This mapping is deliberately built from data the app already tracks
     # honestly (Message.status/.delivered/.attempts, set only when
@@ -1897,29 +3374,38 @@ def render_bubble(msg, contact_name: str, p) -> str:
     # never merely because the local app accepted the send.
     note = ""
     status = getattr(msg, "status", "sent")
-    if outgoing:
+    if note_override is not None:
+        note = note_override
+    elif outgoing:
         if status == "queued":
             attempts = getattr(msg, "attempts", 0)
             text = i18n.tr("Waiting for user…") if attempts > 1 else i18n.tr("User offline - message queued")
             note = f"<div style='color:{p.warn};font-size:11px;'>{text}</div>"
         elif not msg.delivered:
-            note = f"<div style='color:{p.error};font-size:11px;'>{i18n.tr('Waiting…')}</div>"
+            waiting_text = i18n.tr("Waiting…")  # see save_as_text's comment above on why this is not inline
+            note = f"<div style='color:{p.error};font-size:11px;'>{waiting_text}</div>"
         else:
-            note = f"<div style='color:{p.text_muted};font-size:11px;'>{i18n.tr('Delivered')}</div>"
+            delivered_text = i18n.tr("Delivered")
+            note = f"<div style='color:{p.text_muted};font-size:11px;'>{delivered_text}</div>"
 
     # Qt's rich text engine ignores display:inline-block, so a plain div
     # stretches the full width and stops looking like a bubble. Nested tables
     # are part of the subset Qt does support, and give a bubble that hugs its
     # text and sits on the correct side.
+    # border-radius on a table/cell is outside Qt rich text's officially
+    # documented CSS subset, but it degrades harmlessly where unsupported
+    # (square corners, same as before) rather than breaking anything -
+    # worth trying for the rounder, more chat-bubble look most messengers
+    # use, without risking the layout on interpreters where it's ignored.
     bubble = (
-        f"<table cellpadding='7' cellspacing='0' "
-        f"style='background-color:{background};'>"
-        f"<tr><td style='color:{foreground};'>{body}</td></tr></table>"
+        f"<table cellpadding='9' cellspacing='0' "
+        f"style='background-color:{background};border-radius:14px;'>"
+        f"<tr><td style='color:{foreground};border-radius:14px;'>{body}</td></tr></table>"
     )
 
     meta = (
         f"<div style='color:{p.text_muted};font-size:11px;'>"
-        f"{who} &middot; {format_timestamp(msg.timestamp)}</div>"
+        f"{who} &middot; {format_timestamp(msg.timestamp)}{delete_link}</div>"
     )
 
     # Qt's rich-text engine does not auto-mirror raw HTML align='left'/

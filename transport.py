@@ -44,8 +44,22 @@ import socks
 import crypto
 
 PROTOCOL_VERSION = 1
-MAX_FRAME_BYTES = 256 * 1024  # generous for text, small enough to resist abuse
+# Sized to comfortably fit an envelope.py file attachment at its own
+# MAX_FILE_BYTES ceiling (8 MiB raw) after base64 (~1.33x), JSON framing,
+# and the outer wire frame's own base64 of the Box ciphertext (~1.33x
+# again) - roughly 8 MiB * 1.33 * 1.33 =~ 14 MiB, rounded up with headroom
+# for JSON key overhead. Still a firm, bounded ceiling (not unbounded): a
+# hostile peer can make MessageServer buffer at most this many bytes per
+# connection, and MAX_CONCURRENT_CONNECTIONS/MAX_QUEUED_CONNECTIONS below
+# already bound how many connections can be doing that at once.
+MAX_FRAME_BYTES = 20 * 1024 * 1024
 CONNECT_TIMEOUT = 60  # onion connections are slow; be patient
+# A large file transfer over three Tor hops can legitimately take minutes,
+# not seconds - this is the socket-level timeout used once a connection is
+# established (both for the sender's send_message() and the receiving
+# MessageServer's per-connection handler), separate from CONNECT_TIMEOUT
+# above which only bounds establishing the circuit.
+TRANSFER_TIMEOUT = 300
 
 # Bounds on the listener, so a connection flood from a hostile peer costs the
 # app almost nothing instead of spawning unbounded threads. This is a single-
@@ -169,6 +183,10 @@ def send_message(
         from tor_service import ONION_PORT
 
         sock.connect((onion, ONION_PORT))
+        # Circuit is up; a large attachment can legitimately take a while to
+        # push through three Tor hops, so relax the timeout for the actual
+        # transfer beyond the (deliberately tighter) connect-phase one.
+        sock.settimeout(TRANSFER_TIMEOUT)
         _send_frame(sock, frame)
 
         # Wait for the peer to acknowledge, so "sent" means it really arrived.
@@ -368,7 +386,14 @@ class MessageServer(threading.Thread):
             self.srv_admission.release()
 
     def serve_connection(self, conn: socket.socket) -> None:
-        conn.settimeout(60)
+        # TRANSFER_TIMEOUT rather than a short fixed value so a large
+        # attachment arriving slowly over Tor is not cut off mid-receive.
+        # This does hold a connection slot open longer on a slow transfer,
+        # but that is still bounded, not unbounded: MAX_CONCURRENT_CONNECTIONS
+        # and MAX_QUEUED_CONNECTIONS above already cap how many connections
+        # (fast or slow) can be occupying a slot at once, and a connection
+        # sending nothing at all still times out and is dropped.
+        conn.settimeout(TRANSFER_TIMEOUT)
         try:
             frame = _recv_frame(conn)
 

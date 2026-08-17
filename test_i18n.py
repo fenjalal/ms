@@ -297,8 +297,21 @@ def main() -> None:
     # shown, regardless of setVisible() - isVisibleTo() reflects the
     # widget's own visibility flag independent of that.
     check("restart notice starts hidden", not dialog.restart_notice.isVisibleTo(dialog))
+    check("restart button starts hidden", not dialog.restart_button.isVisibleTo(dialog))
+    check("restart_requested starts False", dialog.restart_requested is False)
     dialog.language_combo.setCurrentIndex((dialog.language_combo.currentIndex() + 1) % dialog.language_combo.count())
     check("restart notice appears after changing language", dialog.restart_notice.isVisibleTo(dialog))
+    check("restart button appears after changing language", dialog.restart_button.isVisibleTo(dialog))
+
+    # Clicking "Restart Now" must flag the request and close the dialog
+    # (QDialog.Accepted) without itself touching Tor/the vault/re-executing
+    # the process - that belongs to MainWindow._restart_app, which only
+    # runs after dialog.exec() returns and this flag is checked (see
+    # MainWindow._on_settings). Exercising the real restart here would
+    # os.execv() this very test process.
+    dialog.restart_button.click()
+    check("restart_requested is set after clicking Restart Now", dialog.restart_requested is True)
+    check("dialog is accepted (closed), not left open", dialog.result() == appmod.QDialog.Accepted)
 
     # "who can reach me" moved here from IdentityDialog, with the same wiring.
     check("open_mode checkbox reflects the vault's current setting", dialog.open_mode.isChecked() == store.identity.accept_from_anyone)
@@ -344,9 +357,15 @@ def main() -> None:
     # translate. status_dot is a single decorative glyph coloured entirely
     # via stylesheet; repo_link is a hyperlink built purely from the
     # constant repository URL (version.REPOSITORY), no words involved.
+    # attach_button is a single paperclip glyph, deliberately NOT wrapped in
+    # self.tr() - see its own comment in app.py: pyside6-lupdate corrupts
+    # non-BMP characters like this one when extracting from Python source,
+    # and a glyph needs no per-language translation anyway (same reasoning
+    # already applied to the lock emoji in _refresh_identity_display).
     allowed_substrings = (
         'self.status_dot = QLabel("\\u25cf")',
         "repo_link = QLabel(f\"<a href='{version.REPOSITORY}'>{version.REPOSITORY}</a>\")",
+        'self.attach_button = QPushButton("\\U0001F4CE")',
     )
     suspects = []
     for i, line in enumerate(lines):
@@ -361,6 +380,30 @@ def main() -> None:
 
     check(f"no unwrapped user-facing string literals found (0 suspects)", len(suspects) == 0)
     for lineno, text in suspects:
+        print(f"    SUSPECT app.py:{lineno}: {text}")
+
+    print("\nStatic guard - a tr()/trf() call nested inside an f-string in app.py:")
+    # A real bug this caught while building the delete-for-everyone feature:
+    # pyside6-lupdate's Python string extraction does not reliably find a
+    # self.tr(...)/i18n.tr(...)/i18n.trf(...) call sitting inside an
+    # f-string's {...} expression (e.g. f"...{i18n.tr('Delete')}...") -
+    # verified empirically against this project's own .ts files: several
+    # such calls (render_bubble's "Delete"/"This message was deleted"/
+    # "Save As…"/"Waiting…", and _render_group_conversation's aggregate
+    # delivery notes) extracted NOTHING at all, silently leaving those
+    # strings permanently untranslated in every language with no error
+    # anywhere - not even test_i18n.py's own suite caught it, since the
+    # string still renders (in English) either way. The fix applied
+    # throughout app.py was always the same: compute the translated text as
+    # its own statement first, then reference that local variable inside
+    # the f-string - never call .tr()/.trf() inline inside {...}. This
+    # guard is the tripwire against a future edit reintroducing the pattern.
+    nested_tr_pattern = re_mod.compile(r'\{[^{}]*\b(self\.tr|i18n\.tr|i18n\.trf|i18n\.fmt)\s*\(')
+    nested_suspects = [
+        (i + 1, line.strip()) for i, line in enumerate(lines) if nested_tr_pattern.search(line)
+    ]
+    check("no tr()/trf()/fmt() call nested inside an f-string expression (0 suspects)", len(nested_suspects) == 0)
+    for lineno, text in nested_suspects:
         print(f"    SUSPECT app.py:{lineno}: {text}")
 
     passed = sum(1 for _, ok in results if ok)
