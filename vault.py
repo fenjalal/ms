@@ -19,6 +19,7 @@ salt, both of which are not secret):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -343,6 +344,70 @@ class GroupInviteRecord:
     used_by_contact_id: str = ""  # set alongside `used`, for the UI's own record
 
 
+# How many chunks pass between durable Vault.save() calls while a transfer
+# is in progress (see Vault.mark_chunk_done()). Vault.save() rewrites and
+# re-encrypts the ENTIRE vault on every call (see save()'s own docstring/
+# comments) - calling it once per 1 MiB chunk of a multi-GB transfer would
+# be a serious write-amplification problem. Batching bounds both how often
+# that full rewrite happens AND how much work (at most this many chunks)
+# would need to be re-sent/re-received after a crash between saves - the
+# two are in tension (bigger batches = fewer rewrites but more possible
+# rework), 10 is a reasonable middle point for 1 MiB chunks (at most 10
+# MiB of rework, at least a 10x reduction in save() frequency).
+FILE_TRANSFER_SAVE_BATCH = 10
+
+
+@dataclass
+class FileTransfer:
+    """
+    Tracks one chunked file transfer's progress - see envelope.py's
+    KIND_FILE_START/KIND_FILE_CHUNK and app.py's ChunkedSendWorker/
+    receive-side handling.
+
+    Deliberately NOT part of Message: a transfer's chunk-tracking state is
+    operational (exists only while the transfer is incomplete, then folds
+    into a normal Message once done - see Vault.complete_file_transfer())
+    rather than a permanent display record, so keeping it separate avoids
+    adding fields to every ordinary Message that are almost always empty.
+
+    The chunk BYTES themselves are never stored here or in vault.dat while
+    a transfer is in progress - only which chunk indices have been sent/
+    received (chunks_done). An outgoing transfer re-reads bytes from the
+    original file on disk on demand (still there for the duration of the
+    send); an incoming transfer appends bytes to a plaintext temp file
+    under paths.data_dir()/incoming/<id>.part as they arrive, folded into
+    an encrypted Message (like any other attachment) only once complete -
+    see Vault.complete_file_transfer()/_incoming_part_path().
+    """
+
+    id: str  # the transfer_id / wire "tid"
+    contact_id: str  # who this transfer is with (the specific member, for a group send)
+    direction: str  # "out" or "in"
+    filename: str
+    mime: str
+    total_size: int
+    chunk_count: int
+    chunks_done: list[bool] = field(default_factory=list)
+    # direction "out" only: the original file's path on disk, so a
+    # resumed send (including after an app restart, not just an
+    # in-session retry - see DeliveryWorker.resume_transfer) can re-open
+    # it and read the still-missing chunks. If the file has since moved
+    # or been deleted, the resume attempt fails cleanly (a normal
+    # TransportError/OSError from ChunkedSendWorker, handled the same as
+    # any other failed send) rather than silently sending garbage -
+    # there is no way to recover a moved/deleted source file, same
+    # limitation any file-sending feature has.
+    source_path: str = ""
+    group_id: str = ""
+    client_msg_id: str = ""  # ties an outgoing transfer to its placeholder Message bubble
+    started: str = ""
+    completed: bool = False
+
+    @property
+    def chunks_done_count(self) -> int:
+        return sum(1 for done in self.chunks_done if done)
+
+
 @dataclass
 class Identity:
     private_key: str  # base64 X25519 private key - NEVER leaves this machine
@@ -440,6 +505,7 @@ class Vault:
         self.identity: Identity | None = None
         self.contacts: list[Contact] = []
         self.groups: list[Group] = []
+        self.file_transfers: list[FileTransfer] = []
         # Guards every read/mutation of identity/contacts and every save().
         # This object is called concurrently from the Qt UI thread, the
         # DeliveryWorker thread, and MessageServer's connection-handler
@@ -475,6 +541,7 @@ class Vault:
             )
             self.contacts = []
             self.groups = []
+            self.file_transfers = []
             self.save()
 
     def unlock(self, passphrase: str) -> None:
@@ -511,7 +578,28 @@ class Vault:
             # Absent entirely on a vault saved before the group-chat feature
             # existed - defaults to no groups, same "old file keeps working
             # unchanged" migration as everything else in this method.
-            self.groups = [Group(**g) for g in data.get("groups", [])]
+            #
+            # issued_invites needs its own reconstruction step: json.loads
+            # gives back plain dicts for everything, but GroupInviteRecord
+            # methods (redeem_group_invite_locally, mark_group_invite_used)
+            # access it via attributes (.code, .used, ...), not dict keys -
+            # a bare Group(**g) would leave those as dicts and crash the
+            # first time an invite is redeemed after any lock/unlock cycle
+            # (i.e. after every app restart). Same pattern already used
+            # just above for Contact.messages (list[Message] reconstructed
+            # from list[dict]).
+            self.groups = [
+                Group(**{
+                    **g,
+                    "issued_invites": [
+                        GroupInviteRecord(**r) for r in g.get("issued_invites", [])
+                    ],
+                })
+                for g in data.get("groups", [])
+            ]
+            self.file_transfers = [
+                FileTransfer(**t) for t in data.get("file_transfers", [])
+            ]
 
             # Lazy, automatic, one-time migration: a vault saved before the
             # bundle feature existed has no signing keypair (the dataclass
@@ -533,6 +621,7 @@ class Vault:
             self.identity = None
             self.contacts = []
             self.groups = []
+            self.file_transfers = []
 
     def save(self) -> None:
         with self._lock:
@@ -543,6 +632,7 @@ class Vault:
                 "identity": asdict(self.identity),
                 "contacts": [asdict(c) for c in self.contacts],
                 "groups": [asdict(g) for g in self.groups],
+                "file_transfers": [asdict(t) for t in self.file_transfers],
             }
             plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             ciphertext = crypto.encrypt_blob(plaintext, self._key)
@@ -1271,6 +1361,252 @@ class Vault:
     def sorted_contacts(self) -> list[Contact]:
         with self._lock:
             return sorted(self.contacts, key=lambda c: c.last_activity, reverse=True)
+
+    # -- file transfers ------------------------------------------------------ #
+    def start_file_transfer(
+        self, contact_id: str, direction: str, filename: str, mime: str,
+        total_size: int, chunk_count: int, group_id: str = "", client_msg_id: str = "",
+        source_path: str = "", transfer_id: str = "",
+    ) -> FileTransfer:
+        """
+        Begin tracking a chunked file transfer (see FileTransfer's
+        docstring). Returns the new record; callers store its `id`
+        (the transfer_id) to reference it on every subsequent chunk.
+        `source_path` (direction "out" only) is the original file's
+        location on disk, persisted so a resumed send - including after
+        an app restart - can find it again (see FileTransfer.source_path).
+
+        `transfer_id`, when given, is used as-is instead of minting a
+        fresh one - REQUIRED for an outgoing transfer, whose id must be
+        the exact same one already embedded in the KIND_FILE_START wire
+        message the caller built (see app.py's _start_contact_chunked_send) -
+        every chunk that follows is tagged with this id, so the wire
+        announcement and the local tracking record generating two
+        different ids independently would mean they never match up on
+        the receiving end. Left empty only for a caller with no
+        wire-level id to match against yet (there is currently no such
+        caller - kept optional rather than required so this signature
+        stays compatible with any future direction="in"-only use).
+        """
+        with self._lock:
+            transfer = FileTransfer(
+                id=transfer_id or str(uuid.uuid4()),
+                contact_id=contact_id,
+                direction=direction,
+                # Already sanitized by envelope.py's _sanitize_filename
+                # before it ever reaches here (both on the sending side,
+                # where the file's own basename is used, and the
+                # receiving side, where it comes from a decoded
+                # KIND_FILE_START) - just a defensive length bound here,
+                # matching the same 255-char ceiling envelope.py itself
+                # enforces (MAX_FILENAME_CHARS), not vault.py's
+                # contact/group name conventions (_clean_name is for
+                # display names, not filenames).
+                filename=(filename.strip() or "file")[:255],
+                mime=mime,
+                total_size=total_size,
+                chunk_count=chunk_count,
+                chunks_done=[False] * chunk_count,
+                source_path=source_path,
+                group_id=group_id,
+                client_msg_id=client_msg_id,
+                started=_now(),
+            )
+            self.file_transfers.append(transfer)
+            self.save()
+            return transfer
+
+    def start_incoming_file_transfer(
+        self, transfer_id: str, contact_id: str, filename: str, mime: str,
+        total_size: int, chunk_count: int, client_msg_id: str,
+    ) -> FileTransfer | None:
+        """
+        Counterpart to start_file_transfer() for the RECEIVING side:
+        unlike an outgoing transfer (whose id this vault mints itself),
+        an incoming transfer's id is the sender's own transfer_id (see
+        envelope.KIND_FILE_START) - every chunk that follows refers to
+        it, so it cannot be regenerated here. Idempotent: returns the
+        existing record unchanged if this transfer_id is already known
+        (e.g. a duplicate/retried file_start), never creating a second
+        FileTransfer for the same id.
+        """
+        with self._lock:
+            existing = self.get_file_transfer(transfer_id)
+            if existing is not None:
+                return existing
+            transfer = FileTransfer(
+                id=transfer_id,
+                contact_id=contact_id,
+                direction="in",
+                filename=(filename.strip() or "file")[:255],
+                mime=mime,
+                total_size=total_size,
+                chunk_count=chunk_count,
+                chunks_done=[False] * chunk_count,
+                client_msg_id=client_msg_id,
+                started=_now(),
+            )
+            self.file_transfers.append(transfer)
+            self.save()
+            return transfer
+
+    def get_file_transfer(self, transfer_id: str) -> FileTransfer | None:
+        with self._lock:
+            for t in self.file_transfers:
+                if t.id == transfer_id:
+                    return t
+            return None
+
+    def mark_chunk_done(self, transfer_id: str, index: int) -> None:
+        """
+        Record that chunk `index` of a transfer has been sent (direction
+        "out") or received (direction "in"). Persists to vault.dat only
+        every FILE_TRANSFER_SAVE_BATCH chunks, or immediately once the
+        transfer is fully complete - see that constant's docstring for
+        why calling save() on every single chunk would be a real
+        performance problem for a large file. Idempotent: marking an
+        already-done index again is a harmless no-op (no double-save).
+        """
+        with self._lock:
+            transfer = self.get_file_transfer(transfer_id)
+            if transfer is None or index < 0 or index >= transfer.chunk_count:
+                return
+            if transfer.chunks_done[index]:
+                return
+            transfer.chunks_done[index] = True
+            done = transfer.chunks_done_count
+            just_completed = done == transfer.chunk_count
+            if just_completed:
+                transfer.completed = True
+            if just_completed or done % FILE_TRANSFER_SAVE_BATCH == 0:
+                self.save()
+
+    def incomplete_transfers_for_contact(self, contact_id: str) -> list[FileTransfer]:
+        """Outgoing transfers to this contact that still have unsent
+        chunks - what DeliveryWorker resumes once the contact is seen
+        online again (see app.py). Only ever "out": an incomplete
+        incoming transfer has nothing for THIS vault to resume sending -
+        it is the sender's job to resume, not the receiver's."""
+        with self._lock:
+            return [
+                t for t in self.file_transfers
+                if t.contact_id == contact_id and t.direction == "out" and not t.completed
+            ]
+
+    def _incoming_part_path(self, transfer_id: str) -> str:
+        """
+        Where an in-progress incoming transfer's bytes accumulate before
+        being folded into an encrypted Message once complete - a
+        plaintext file OUTSIDE vault.dat (under paths.data_dir(), the
+        same directory vault.dat itself lives in, already 0700 per
+        paths._ensure_private_dir), not inside the encrypted vault, so
+        appending a chunk never triggers a full-vault rewrite (see
+        FILE_TRANSFER_SAVE_BATCH's docstring) - only the small
+        FileTransfer bitmap does, batched. Deleted once the transfer
+        completes and its bytes have been folded into a real Message
+        (see complete_file_transfer()) - nothing about the finished
+        attachment's storage model changes: it ends up base64-encoded
+        inside an encrypted Message exactly like a single-shot KIND_FILE
+        attachment always has.
+        """
+        incoming_dir = os.path.join(paths.data_dir(), "incoming")
+        os.makedirs(incoming_dir, mode=0o700, exist_ok=True)
+        os.chmod(incoming_dir, 0o700)
+        safe_id = "".join(c for c in transfer_id if c.isalnum() or c in "-_")
+        return os.path.join(incoming_dir, f"{safe_id}.part")
+
+    def append_incoming_chunk(self, transfer_id: str, data: bytes) -> None:
+        """
+        Append one chunk's raw bytes to this transfer's .part file.
+        Chunks are expected to arrive in order (envelope.py's decode()
+        already range-checks the claimed index against chunk_count, and
+        app.py only calls this after confirming the index is the next
+        expected one - an out-of-order chunk is dropped there, not
+        handled here, since a simple append cannot correctly place a
+        chunk anywhere but the end).
+        """
+        path = self._incoming_part_path(transfer_id)
+        with open(path, "ab") as f:
+            f.write(data)
+        os.chmod(path, 0o600)
+
+    def read_and_discard_incoming_part(self, transfer_id: str) -> bytes:
+        """Read a completed transfer's accumulated bytes and delete the
+        temp file - called exactly once, when the last chunk arrives, to
+        fold the result into a real Message via add_message() (see
+        app.py). Returns b"" if the part file is somehow missing rather
+        than raising, so a caller can treat that as "nothing to fold in"
+        without a special-cased try/except at every call site."""
+        path = self._incoming_part_path(transfer_id)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return b""
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return data
+
+    def complete_incoming_transfer(self, transfer_id: str) -> bool:
+        """
+        Fold a just-completed incoming transfer's assembled bytes into
+        its placeholder Message (matched by client_msg_id, direction
+        "in") - the SAME storage model a single-shot KIND_FILE
+        attachment already uses (base64 inside an encrypted Message);
+        only how the bytes were assembled beforehand (chunk by chunk,
+        via append_incoming_chunk) is new. Reads and deletes the .part
+        file, updates the Message, discards the FileTransfer record, and
+        saves - all in one lock acquisition, so app.py never has to
+        reach into Message internals directly. Returns False (leaving
+        everything as-is) if the transfer or its matching Message cannot
+        be found, so a caller can distinguish "nothing to do" from "did
+        it."
+        """
+        with self._lock:
+            transfer = self.get_file_transfer(transfer_id)
+            if transfer is None:
+                return False
+            contact = self.get_contact(transfer.contact_id)
+            if contact is None:
+                return False
+            message = next(
+                (m for m in contact.messages
+                 if m.client_msg_id == transfer.client_msg_id and m.direction == "in"),
+                None,
+            )
+            if message is None:
+                return False
+
+            data = self.read_and_discard_incoming_part(transfer_id)
+            # Standard (padded) base64 via the stdlib module - NOT
+            # crypto.b64encode (that's URL-safe/no-padding, used only for
+            # keys/fingerprints elsewhere in this file). Every other
+            # attachment code path (envelope.py's KIND_FILE encode/decode,
+            # app.py's Save As.../render_bubble) already reads
+            # Message.body as standard base64 - this has to match exactly
+            # or a completed chunked transfer's body is silently
+            # undecodable (binascii.Error: Incorrect padding) the moment
+            # anything tries to read it back.
+            message.body = base64.b64encode(data).decode("ascii")
+            message.attachment_size = len(data)
+            self.file_transfers = [t for t in self.file_transfers if t.id != transfer_id]
+            self.save()
+            return True
+
+    def discard_file_transfer(self, transfer_id: str) -> None:
+        """Forget a transfer's tracking record (e.g. after it has been
+        folded into a Message, or abandoned) and clean up any leftover
+        .part file - the counterpart to start_file_transfer()."""
+        with self._lock:
+            self.file_transfers = [t for t in self.file_transfers if t.id != transfer_id]
+            self.save()
+        path = self._incoming_part_path(transfer_id)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     # -- contact policy ---------------------------------------------------- #
     def accepted_contacts(self) -> list[Contact]:

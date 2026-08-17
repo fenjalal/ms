@@ -62,17 +62,37 @@ from dataclasses import dataclass
 
 MAX_BODY_CHARS = 8000  # generous for text, bounded against a hostile giant "message"
 
-# Raw (pre-base64) file size ceiling. Base64 adds ~33%, the JSON envelope
-# and NaCl Box add a little more, and the whole thing is base64'd again for
-# the outer wire frame (see transport.py) - transport.MAX_FRAME_BYTES is
-# set with this constant's overhead already accounted for.
+# Raw (pre-base64) file size ceiling for a SINGLE, non-chunked KIND_FILE
+# envelope. Base64 adds ~33%, the JSON envelope and NaCl Box add a little
+# more, and the whole thing is base64'd again for the outer wire frame (see
+# transport.py) - transport.MAX_FRAME_BYTES is set with this constant's
+# overhead already accounted for. A file this size or smaller always goes
+# out as one plain KIND_FILE envelope, unchanged from before chunking
+# existed (see app.py's _on_send_file) - chunking (KIND_FILE_START/
+# KIND_FILE_CHUNK, below) only kicks in above this size.
 MAX_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+# Raw (pre-base64) size of one chunk. Comfortably under
+# transport.MAX_FRAME_BYTES even after the same base64/JSON/Box/outer-
+# base64 overhead chain MAX_FILE_BYTES's comment describes, and small
+# enough that per-chunk progress feels smooth (1000 steps per GiB) without
+# per-chunk overhead (a full envelope + a full Tor circuit per chunk - see
+# transport.py's connection model) dominating for very large transfers.
+CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
+
+# Ceiling on total transfer size (chunk_count * CHUNK_SIZE), enforced at
+# KIND_FILE_START decode time before a single chunk is ever accepted -
+# generous over "hundreds of MB to multi-GB" real use, while still being a
+# firm, documented ceiling rather than unbounded (same "never accept an
+# arbitrarily large claimed size" discipline as every other limit here).
+MAX_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 MAX_FILENAME_CHARS = 255
 MAX_MIME_CHARS = 100
 MAX_GID_CHARS = 64
 MAX_GNAME_CHARS = 100
 MAX_MID_CHARS = 64
+MAX_TRANSFER_ID_CHARS = 64
 
 KIND_TEXT = "text"
 KIND_FILE = "file"
@@ -83,7 +103,17 @@ KIND_DELETE = "delete"
 # so padding them to the smallest text bucket would not hide anything).
 KIND_GROUP_ACK = "group_ack"
 KIND_GROUP_LEAVE = "group_leave"
-_KNOWN_KINDS = {KIND_TEXT, KIND_FILE, KIND_DELETE, KIND_GROUP_ACK, KIND_GROUP_LEAVE}
+# Chunked file transfer, for anything over MAX_FILE_BYTES (see CHUNK_SIZE/
+# MAX_TRANSFER_BYTES above). KIND_FILE_START announces the transfer
+# (filename/mime/total size/chunk count, no file bytes); KIND_FILE_CHUNK
+# carries exactly one chunk's bytes, tagged with which transfer and which
+# index it belongs to. See encode_file_start()/encode_file_chunk() below.
+KIND_FILE_START = "file_start"
+KIND_FILE_CHUNK = "file_chunk"
+_KNOWN_KINDS = {
+    KIND_TEXT, KIND_FILE, KIND_DELETE, KIND_GROUP_ACK, KIND_GROUP_LEAVE,
+    KIND_FILE_START, KIND_FILE_CHUNK,
+}
 
 # Fixed size buckets the final JSON envelope is padded up to before
 # encryption, so its ciphertext length (visible to anyone watching the wire
@@ -138,6 +168,16 @@ class Envelope:
     # set for a group this vault owns/created itself - an owner's own
     # messages need no invite code, they were never invited.
     invcode: str = ""
+    # KIND_FILE_START/KIND_FILE_CHUNK only: the transfer these belong to
+    # (see vault.FileTransfer). filename/mime/size on a KIND_FILE_START
+    # describe the WHOLE file (reusing the same field names/semantics as
+    # KIND_FILE above, just announced ahead of the bytes rather than
+    # alongside them); size is chunk_count * CHUNK_SIZE at most (never
+    # trusted beyond that - see decode()'s cross-check against
+    # MAX_TRANSFER_BYTES). chunk_index/chunk_count are 0-based/total.
+    transfer_id: str = ""
+    chunk_index: int = 0
+    chunk_count: int = 0
 
 
 def _sanitize_filename(name: str) -> str:
@@ -226,6 +266,81 @@ def encode_file(
         payload["mid"] = mid[:MAX_MID_CHARS]
     if invcode:
         payload["invcode"] = invcode[:MAX_INVCODE_CHARS]
+    return _pad(payload)
+
+
+def encode_file_start(
+    transfer_id: str, filename: str, mime: str, total_size: int, chunk_count: int,
+    gid: str = "", gname: str = "", mid: str = "", invcode: str = "",
+) -> str:
+    """
+    Announce a chunked file transfer, ahead of any of its
+    KIND_FILE_CHUNK bytes - see the module docstring's chunking section.
+    Carries only metadata (filename/mime/total size/chunk count), never
+    file bytes, so it stays small and fixed-shape like KIND_TEXT.
+
+    Raises EnvelopeError if total_size exceeds MAX_TRANSFER_BYTES or does
+    not match chunk_count * CHUNK_SIZE within one chunk's slack (the last
+    chunk is allowed to be smaller than CHUNK_SIZE) - the same
+    "validate before it ever goes out" discipline encode_file() already
+    applies to MAX_FILE_BYTES.
+    """
+    if not transfer_id:
+        raise EnvelopeError("Cannot start a file transfer with no transfer id.")
+    if chunk_count <= 0:
+        raise EnvelopeError("A file transfer needs at least one chunk.")
+    if total_size > MAX_TRANSFER_BYTES:
+        raise EnvelopeError(
+            f"File is too large ({total_size} bytes; the limit is {MAX_TRANSFER_BYTES} bytes)."
+        )
+    if total_size <= (chunk_count - 1) * CHUNK_SIZE or total_size > chunk_count * CHUNK_SIZE:
+        raise EnvelopeError("Chunk count does not match the file's total size.")
+
+    payload: dict = {
+        "k": KIND_FILE_START,
+        "tid": transfer_id[:MAX_TRANSFER_ID_CHARS],
+        "filename": _sanitize_filename(filename),
+        "mime": (mime or "application/octet-stream")[:MAX_MIME_CHARS],
+        "size": total_size,
+        "chunks": chunk_count,
+    }
+    if gid:
+        payload["gid"] = gid[:MAX_GID_CHARS]
+        payload["gname"] = gname[:MAX_GNAME_CHARS]
+    if mid:
+        payload["mid"] = mid[:MAX_MID_CHARS]
+    if invcode:
+        payload["invcode"] = invcode[:MAX_INVCODE_CHARS]
+    return _pad(payload)
+
+
+def encode_file_chunk(transfer_id: str, index: int, chunk_count: int, data: bytes) -> str:
+    """
+    One chunk of a transfer announced by encode_file_start(). `index` is
+    0-based; `chunk_count` is repeated here (not just in KIND_FILE_START)
+    so a chunk arriving with no matching KIND_FILE_START on file (e.g.
+    delivered out of order, or the start message was lost) can still be
+    range-checked (0 <= index < chunk_count) without needing that earlier
+    message - the receiving side still only ACTS on a chunk once it has
+    seen a matching file_start (see app.py), this is just decode-time
+    sanity, same spirit as every other "recompute/validate, never trust
+    blindly" check in this module.
+    """
+    if not transfer_id:
+        raise EnvelopeError("Cannot send a file chunk with no transfer id.")
+    if index < 0 or chunk_count <= 0 or index >= chunk_count:
+        raise EnvelopeError("Chunk index out of range.")
+    if len(data) > CHUNK_SIZE:
+        raise EnvelopeError(
+            f"Chunk is too large ({len(data)} bytes; the limit is {CHUNK_SIZE} bytes)."
+        )
+    payload: dict = {
+        "k": KIND_FILE_CHUNK,
+        "tid": transfer_id[:MAX_TRANSFER_ID_CHARS],
+        "i": index,
+        "chunks": chunk_count,
+        "body": base64.b64encode(data).decode("ascii"),
+    }
     return _pad(payload)
 
 
@@ -335,6 +450,81 @@ def decode(plaintext: str) -> Envelope:
         if not isinstance(body, str) or len(body) > MAX_BODY_CHARS:
             raise EnvelopeError("Malformed text envelope.")
         return Envelope(kind=KIND_TEXT, body=body, gid=gid, gname=gname, mid=mid, invcode=invcode)
+
+    if kind == KIND_FILE_START:
+        filename = parsed.get("filename")
+        mime = parsed.get("mime")
+        total_size = parsed.get("size")
+        chunk_count = parsed.get("chunks")
+        if (
+            not isinstance(filename, str) or not isinstance(mime, str)
+            or not isinstance(total_size, int) or not isinstance(chunk_count, int)
+            or isinstance(total_size, bool) or isinstance(chunk_count, bool)
+        ):
+            raise EnvelopeError("Malformed file-start envelope.")
+        if len(filename) > MAX_FILENAME_CHARS or len(mime) > MAX_MIME_CHARS:
+            raise EnvelopeError("Malformed file-start envelope.")
+        transfer_id = parsed.get("tid")
+        if not isinstance(transfer_id, str) or not transfer_id:
+            raise EnvelopeError("Malformed file-start envelope.")
+        transfer_id = transfer_id[:MAX_TRANSFER_ID_CHARS]
+        if chunk_count <= 0:
+            raise EnvelopeError("Malformed file-start envelope.")
+        if total_size > MAX_TRANSFER_BYTES:
+            raise EnvelopeError("File is too large.")
+        # Cross-check the claimed total against the claimed chunk count -
+        # same "a claimed field must be internally consistent, not just
+        # present" discipline as every size check in this module. This
+        # does NOT make total_size trustworthy on its own (a hostile
+        # sender could still claim a smaller total than what they
+        # actually send) - the receiving side's real enforcement is that
+        # each individual KIND_FILE_CHUNK is itself capped at CHUNK_SIZE
+        # and range-checked against chunk_count (see below), so the
+        # actual bytes accepted can never exceed chunk_count * CHUNK_SIZE
+        # regardless of what "size" claims.
+        if total_size <= (chunk_count - 1) * CHUNK_SIZE or total_size > chunk_count * CHUNK_SIZE:
+            raise EnvelopeError("Malformed file-start envelope.")
+        return Envelope(
+            kind=KIND_FILE_START,
+            gid=gid, gname=gname, mid=mid, invcode=invcode,
+            filename=_sanitize_filename(filename),
+            mime=mime[:MAX_MIME_CHARS],
+            size=total_size,
+            transfer_id=transfer_id,
+            chunk_count=chunk_count,
+        )
+
+    if kind == KIND_FILE_CHUNK:
+        transfer_id = parsed.get("tid")
+        index = parsed.get("i")
+        chunk_count = parsed.get("chunks")
+        body = parsed.get("body")
+        if (
+            not isinstance(transfer_id, str) or not transfer_id
+            or not isinstance(index, int) or isinstance(index, bool)
+            or not isinstance(chunk_count, int) or isinstance(chunk_count, bool)
+            or not isinstance(body, str)
+        ):
+            raise EnvelopeError("Malformed file-chunk envelope.")
+        transfer_id = transfer_id[:MAX_TRANSFER_ID_CHARS]
+        if chunk_count <= 0 or index < 0 or index >= chunk_count:
+            raise EnvelopeError("Chunk index out of range.")
+        if len(body) > int(CHUNK_SIZE * 1.5):  # generous base64-overhead margin
+            raise EnvelopeError("Chunk is too large.")
+        try:
+            decoded = base64.b64decode(body, validate=True)
+        except Exception as exc:
+            raise EnvelopeError("Chunk is not valid base64.") from exc
+        if len(decoded) > CHUNK_SIZE:
+            raise EnvelopeError("Chunk is too large.")
+        return Envelope(
+            kind=KIND_FILE_CHUNK,
+            body=body,
+            transfer_id=transfer_id,
+            chunk_index=index,
+            chunk_count=chunk_count,
+            size=len(decoded),
+        )
 
     # KIND_FILE
     filename = parsed.get("filename")

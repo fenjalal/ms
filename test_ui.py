@@ -277,6 +277,37 @@ def main() -> None:
         stranger_onion not in window.thread_view.toHtml(),
     )
 
+    print("\nA stranger's first message is decoded before storage, not stored as raw envelope JSON:")
+    # The bug this guards against: _on_message_arrived used to store a
+    # STATUS_PENDING sender's message body completely raw (the literal
+    # wire envelope, e.g. {"k": "text", "body": "hi", "mid": "...", "p":
+    # "000...0"} - the padding field included) instead of decoding it
+    # first, so the request preview/thread showed the whole JSON blob
+    # instead of the actual text the stranger typed.
+    import envelope as envelope_mod
+    _, stranger2_pub = crypto.generate_keypair()
+    stranger2_pub_b64 = crypto.b64encode(stranger2_pub)
+    stranger2_onion = "k" * 56 + ".onion"
+    store.may_receive_from(stranger2_pub_b64, stranger2_onion)
+    wire = envelope_mod.encode_text("hello there", mid="test-mid-123")
+    window._on_message_arrived(stranger2_pub_b64, wire)
+    pending2 = store.find_by_public_key(stranger2_pub_b64)
+    stored_body = pending2.messages[-1].body
+    check("stranger's first-message body is the decoded text, not raw JSON", stored_body == "hello there")
+    check("stored body does not start with the envelope's '{\"k\":' shape", not stored_body.startswith("{"))
+    check("padding field never leaks into a displayed message", '"p":' not in stored_body)
+
+    # A file attachment from a not-yet-accepted stranger must show a
+    # placeholder, never the raw base64 file bytes.
+    _, stranger3_pub = crypto.generate_keypair()
+    stranger3_pub_b64 = crypto.b64encode(stranger3_pub)
+    store.may_receive_from(stranger3_pub_b64, "l" * 56 + ".onion")
+    file_wire = envelope_mod.encode_file("secret.pdf", "application/pdf", b"raw pdf bytes")
+    window._on_message_arrived(stranger3_pub_b64, file_wire)
+    pending3 = store.find_by_public_key(stranger3_pub_b64)
+    file_body = pending3.messages[-1].body
+    check("stranger's file attachment shows a placeholder, not raw base64", "cGRm" not in file_body and "raw pdf" not in file_body)
+
     window.close()
     try:
         os.remove(onion_path)
@@ -579,6 +610,58 @@ def main() -> None:
     check("veilwire-mark.png (the real brand source) is present", os.path.exists(mark_source))
     icon = appmod.icon_file()
     check("resolved app icon is a real, non-null image", icon is not None and not QIcon(icon).isNull())
+
+    print("\nSidebar stays responsive at its documented minimum width (no clipped buttons):")
+    # The bug this guards against: four buttons (Add/New Group/Join
+    # Group/Remove) in one row, and separately "Share"/"Keys"/"Settings"
+    # in another, both overflowed the sidebar's minimum width and got
+    # visually clipped ("Settings" rendered as "etting"). Splitting the
+    # contact-action row into two rows and widening the documented
+    # minimum fixed it - this asserts the actual enforced minimum, not
+    # just that the code runs, so a future change that narrows it back
+    # down is caught here rather than only by eyeballing a screenshot.
+    responsive_path = "/tmp/uitest_responsive.dat"
+    try:
+        os.remove(responsive_path)
+    except OSError:
+        pass
+    store = vm.Vault(responsive_path)
+    store.create("responsive test passphrase")
+    store.set_onion("q" * 56 + ".onion", "ED25519-V3:K")
+    appmod.MainWindow._start_network = lambda self: None
+    window = appmod.MainWindow(store)
+    window.resize(1280, 780)
+
+    from PySide6.QtWidgets import QSplitter
+    splitter = window.centralWidget().findChild(QSplitter)
+    window.show()
+    app.processEvents()
+    # Try to force the sidebar narrower than any button row needs - Qt
+    # clamps a QSplitter child to its own minimumWidth(), so the actual
+    # resulting width is what matters, not the requested one.
+    splitter.setSizes([50, 1230])
+    app.processEvents()
+    actual_sidebar_width = splitter.sizes()[0]
+    check("sidebar cannot be dragged narrower than its buttons need", actual_sidebar_width >= 290)
+
+    # Every sidebar button's actual rendered width must fit within the
+    # enforced sidebar width - proves there's no button silently
+    # overflowing/clipping at that minimum, rather than just checking the
+    # panel's declared minimumWidth() in isolation.
+    from PySide6.QtWidgets import QPushButton
+    sidebar_buttons = [
+        w for w in window.findChildren(QPushButton)
+        if w.text() in ("Add", "Remove", "New Group", "Join Group", "Share", "Keys", "Settings")
+    ]
+    check("all expected sidebar buttons were found", len(sidebar_buttons) >= 7)
+    for button in sidebar_buttons:
+        check(f"button '{button.text()}' fits within the sidebar width", button.width() <= actual_sidebar_width)
+
+    window.close()
+    try:
+        os.remove(responsive_path)
+    except OSError:
+        pass
 
     passed = sum(1 for _, ok in results if ok)
     print(f"\n{passed}/{len(results)} checks passed")

@@ -371,6 +371,122 @@ class SendWorker(QThread):
             self.done.emit(False, safe_error_text(exc, self.tr("An unexpected error occurred while sending.")))
 
 
+class ChunkedSendWorker(QThread):
+    """
+    Sends a large file (over envelope.MAX_FILE_BYTES) as a sequence of
+    KIND_FILE_CHUNK envelopes - one transport.send_message() call per
+    chunk, sequentially (same one-connection-per-message model as every
+    other send in this app - see transport.py's own docstring on why
+    that was kept simple rather than reusing one Tor connection across
+    the whole transfer).
+
+    Reads chunk bytes from the ORIGINAL file on disk on demand - never
+    loads the whole file into memory at once, which is the entire point
+    of chunking a multi-GB transfer. Only sends chunks whose index is
+    NOT YET in `already_done` (the transfer's vault.FileTransfer.chunks_done
+    bitmap at the time this worker was started) - this is what makes a
+    resumed transfer (see DeliveryWorker's resume branch) skip
+    already-acknowledged chunks instead of resending the whole file.
+
+    Stops (does not loop retrying) the first time a chunk's
+    transport.send_message() raises TransportError - e.g. the contact
+    went offline mid-transfer. The chunks already sent stay marked done
+    (vault.Vault.mark_chunk_done was already called for each one as it
+    succeeded), so the NEXT attempt (a manual retry or DeliveryWorker's
+    sweep) only needs to send what's left, never restarting from zero.
+
+    `start_wire`, when given, is a pre-built KIND_FILE_START envelope
+    sent once, before the first chunk - the initial send's announcement.
+    Sent from THIS background thread (not synchronously on the UI thread
+    from _start_contact_chunked_send) so a slow/stalled connection to a
+    just-gone-offline contact cannot block the UI for up to
+    transport.CONNECT_TIMEOUT seconds, the same reasoning every other
+    network call in this app already routes through a QThread for. Left
+    unset (None) on a resume (see DeliveryWorker.resume_transfer) - the
+    receiver already has this transfer's FileTransfer record from the
+    first attempt, so re-announcing it is unnecessary. A start_wire send
+    failure is caught and logged the same as a chunk's, and does NOT
+    stop the chunk loop from being attempted anyway - the receiver's
+    _on_file_chunk tolerates a chunk with no prior file_start by
+    starting the transfer implicitly (see that method's docstring).
+    """
+
+    # transfer_id, chunk_index_just_sent
+    progress = Signal(str, int)
+    # transfer_id, success, error
+    done = Signal(str, bool, str)
+
+    def __init__(
+        self, transfer_id: str, file_path: str, chunk_count: int,
+        already_done: set[int], onion: str, their_public_b64: str,
+        my_private: bytes, my_public_b64: str, my_onion: str, socks_port: int,
+        gid: str = "", gname: str = "", start_wire: str | None = None,
+    ) -> None:
+        super().__init__()
+        self._transfer_id = transfer_id
+        self._file_path = file_path
+        self._chunk_count = chunk_count
+        self._already_done = already_done
+        self._onion = onion
+        self._their_public_b64 = their_public_b64
+        self._my_private = my_private
+        self._my_public_b64 = my_public_b64
+        self._my_onion = my_onion
+        self._socks_port = socks_port
+        self._gid = gid
+        self._gname = gname
+        self._start_wire = start_wire
+
+    def _send(self, wire_body: str) -> None:
+        transport.send_message(
+            onion=self._onion,
+            their_public_b64=self._their_public_b64,
+            body=wire_body,
+            my_private=self._my_private,
+            my_public_b64=self._my_public_b64,
+            my_onion=self._my_onion,
+            socks_port=self._socks_port,
+        )
+
+    def run(self) -> None:
+        try:
+            if self._start_wire is not None:
+                try:
+                    self._send(self._start_wire)
+                except transport.TransportError:
+                    pass  # see docstring: chunks are still attempted; receiver tolerates a missing file_start
+            with open(self._file_path, "rb") as f:
+                for index in range(self._chunk_count):
+                    if index in self._already_done:
+                        continue
+                    f.seek(index * envelope.CHUNK_SIZE)
+                    chunk = f.read(envelope.CHUNK_SIZE)
+                    wire_body = envelope.encode_file_chunk(
+                        self._transfer_id, index, self._chunk_count, chunk,
+                    )
+                    self._send(wire_body)
+                    self._already_done.add(index)
+                    self.progress.emit(self._transfer_id, index)
+        except OSError as exc:
+            _logger.exception("Could not read file during chunked send")
+            self.done.emit(
+                self._transfer_id, False,
+                safe_error_text(exc, self.tr("Could not read that file.")),
+            )
+            return
+        except transport.TransportError as exc:
+            self.done.emit(self._transfer_id, False, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            _logger.exception("Unexpected error during chunked send")
+            self.done.emit(
+                self._transfer_id, False,
+                safe_error_text(exc, self.tr("An unexpected error occurred while sending.")),
+            )
+            return
+        self.done.emit(self._transfer_id, True, "")
+
+
 class GroupSendWorker(QThread):
     """
     Delivers one group message: an individually Box-encrypted, individually
@@ -1155,6 +1271,14 @@ class DeliveryWorker(QThread):
     message_sent = Signal(str, str)        # contact_id, message_id
     message_failed = Signal(str, str, str)  # contact_id, message_id, reason
     activity = Signal(str, str)            # level, text
+    # transfer_id - a chunked transfer to a now-online contact still has
+    # unsent chunks. This worker only DETECTS that (see _sweep below) - it
+    # cannot launch a ChunkedSendWorker itself (that's a QThread and must
+    # be started from the UI thread, which also owns
+    # MainWindow._chunked_send_workers), so it hands off via this signal
+    # instead, the same "worker detects/reports, MainWindow acts" split
+    # already used for presence_changed/message_sent/message_failed.
+    resume_transfer = Signal(str)
 
     INTERVAL = 45  # seconds between sweeps
 
@@ -1200,9 +1324,19 @@ class DeliveryWorker(QThread):
             if self._stop.is_set():
                 return
             online = transport.check_reachable(contact.onion, socks_port)
+            was_offline = self._online.get(contact.id) is False
             if self._online.get(contact.id) != online:
                 self._online[contact.id] = online
                 self.presence_changed.emit(contact.id, online)
+            # Resume any interrupted chunked transfer the moment this
+            # contact is seen online again - see FileTransfer's docstring
+            # on resumability. Only fires on an offline->online edge (not
+            # every sweep while already online) so a transfer already
+            # being actively sent by ChunkedSendWorker is not re-launched
+            # in parallel with itself every 45 seconds.
+            if online and was_offline:
+                for transfer in self._vault.incomplete_transfers_for_contact(contact.id):
+                    self.resume_transfer.emit(transfer.id)
 
         queued = self._vault.queued_messages()
         if not queued:
@@ -1293,6 +1427,13 @@ class MainWindow(QMainWindow):
         # would file the send result under whichever contact happens to be
         # selected when the worker finishes, not the one it was sent to.
         self._pending_contact_id: str | None = None
+        # Keyed by transfer_id (vault.FileTransfer.id), not a single
+        # slot like _send_worker - more than one chunked transfer can be
+        # in flight at once (e.g. a user-initiated send to one contact
+        # while DeliveryWorker resumes an interrupted transfer to
+        # another), so each needs its own worker reference to avoid one
+        # overwriting/orphaning another's `finished` cleanup.
+        self._chunked_send_workers: dict[str, "ChunkedSendWorker"] = {}
 
         self.tor = tor_service.TorManager(data_dir=os.path.join(paths.data_dir(), "tor-data"))
         self.server: MessageServer | None = None
@@ -1384,7 +1525,15 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(240)
+        # 290, not 240: three QPushButtons ("Share"/"Keys"/"Settings",
+        # already shortened to their minimum practical labels - see the
+        # button_row comment below) need ~274px on their own even at
+        # Qt's default per-button padding, before the panel's own left/
+        # right margins (12 + 6) are added - 240 clipped "Settings" to
+        # "etting" at the sidebar's documented minimum width. Verified
+        # empirically (QWidget.sizeHint() on the real button row), not
+        # just estimated, before picking this number.
+        panel.setMinimumWidth(290)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 6, 12)
         layout.setSpacing(8)
@@ -1432,6 +1581,13 @@ class MainWindow(QMainWindow):
         self.fingerprint_label.setStyleSheet(
             f"color: {self.palette_colors.text_muted}; font-family: monospace;"
         )
+        # Word-wrap rather than the default single-line clip - a
+        # monospace fingerprint ("FP: XXXX XXXX XXXX XXXX XXXX") is
+        # wider than the sidebar's minimum width can show on one line,
+        # and silently truncating a value the user is meant to read
+        # aloud to verify a contact is worse than wrapping it onto a
+        # second line.
+        self.fingerprint_label.setWordWrap(True)
         self.fingerprint_label.setToolTip(
             self.tr("Your fingerprint. Read it to a contact so they can verify you.")
         )
@@ -1448,26 +1604,36 @@ class MainWindow(QMainWindow):
         self.contact_list.customContextMenuRequested.connect(self._on_contact_menu)
         layout.addWidget(self.contact_list, stretch=1)
 
-        row = QHBoxLayout()
+        # Two rows, not one - four buttons ("Add"/"New Group"/"Join Group"/
+        # "Remove") in a single QHBoxLayout at the sidebar's default width
+        # (340px, 240px minimum - see the splitter setup) clipped the
+        # later buttons' text under several languages, most visibly
+        # "Join Group"/"New Group" together. Splitting into contact
+        # actions (Add/Remove) and group actions (New/Join) keeps each
+        # row to two buttons, which fits comfortably down to the sidebar's
+        # actual minimum width instead of only at a wide window size.
+        contact_row = QHBoxLayout()
         add_button = QPushButton(self.tr("Add"))
         add_button.clicked.connect(self._on_add_contact)
-        row.addWidget(add_button)
+        contact_row.addWidget(add_button)
 
+        remove_button = QPushButton(self.tr("Remove"))
+        remove_button.clicked.connect(self._on_remove_contact)
+        contact_row.addWidget(remove_button)
+        layout.addLayout(contact_row)
+
+        group_row = QHBoxLayout()
         new_group_button = QPushButton(self.tr("New Group"))
         new_group_button.clicked.connect(self._on_new_group)
-        row.addWidget(new_group_button)
+        group_row.addWidget(new_group_button)
 
         join_group_button = QPushButton(self.tr("Join Group"))
         join_group_button.setToolTip(
             self.tr("Paste an invite someone sent you to join their group.")
         )
         join_group_button.clicked.connect(self._on_join_group)
-        row.addWidget(join_group_button)
-
-        remove_button = QPushButton(self.tr("Remove"))
-        remove_button.clicked.connect(self._on_remove_contact)
-        row.addWidget(remove_button)
-        layout.addLayout(row)
+        group_row.addWidget(join_group_button)
+        layout.addLayout(group_row)
 
         return panel
 
@@ -1641,6 +1807,7 @@ class MainWindow(QMainWindow):
         self.delivery.presence_changed.connect(self._on_presence_changed)
         self.delivery.message_sent.connect(self._on_queued_sent)
         self.delivery.activity.connect(self._on_health_status)
+        self.delivery.resume_transfer.connect(self._on_resume_transfer)
         self.delivery.start()
         self.delivery.wake()   # deliver anything left over from last session
 
@@ -2213,6 +2380,39 @@ class MainWindow(QMainWindow):
             self._on_remove_contact()
 
     # -- Conversation ------------------------------------------------------- #
+    def _transfer_progress_note(self, msg: vault_mod.Message) -> str | None:
+        """
+        For a message that is one half of an in-progress chunked file
+        transfer (see vault.FileTransfer/ChunkedSendWorker), returns the
+        "Uploading... 42%"/"Receiving... 42%" note to show in place of
+        the normal delivered/queued note - None for every other message
+        (render_bubble's note_override=None means "use the normal
+        delivered/queued logic", so this only overrides display for the
+        specific messages actually mid-transfer).
+
+        Looked up by client_msg_id, not stored as its own Message field -
+        FileTransfer.client_msg_id is exactly this Message's own
+        client_msg_id for the message that started the transfer (see
+        _start_contact_chunked_send/the receive-side KIND_FILE_START
+        handling), so this join is a plain linear scan over
+        self.vault.file_transfers, which is small (only ever the
+        currently-in-flight transfers, not history).
+        """
+        client_msg_id = getattr(msg, "client_msg_id", "")
+        if not client_msg_id:
+            return None
+        for transfer in self.vault.file_transfers:
+            if transfer.client_msg_id != client_msg_id or transfer.completed:
+                continue
+            percent = int(100 * transfer.chunks_done_count / transfer.chunk_count) if transfer.chunk_count else 0
+            p = self.palette_colors
+            if transfer.direction == "out":
+                text = i18n.fmt(self.tr("Uploading… %(percent)s%%"), percent=percent)
+            else:
+                text = i18n.fmt(self.tr("Receiving… %(percent)s%%"), percent=percent)
+            return f"<div style='color:{p.text_muted};font-size:11px;'>{text}</div>"
+        return None
+
     def _render_conversation(
         self, contact: vault_mod.Contact | None, group: vault_mod.Group | None = None,
     ) -> None:
@@ -2336,7 +2536,10 @@ class MainWindow(QMainWindow):
         )
         for msg in ordered:
             self._rendered_messages[msg.id] = msg
-        blocks = [render_bubble(msg, contact.name, p) for msg in ordered]
+        blocks = [
+            render_bubble(msg, contact.name, p, note_override=self._transfer_progress_note(msg))
+            for msg in ordered
+        ]
 
         self.thread_view.setHtml("".join(blocks))
         bar = self.thread_view.verticalScrollBar()
@@ -2967,14 +3170,33 @@ class MainWindow(QMainWindow):
                 safe_error_text(exc, self.tr("Could not read that file.")),
             )
             return
-        if size > envelope.MAX_FILE_BYTES:
+        if size > envelope.MAX_TRANSFER_BYTES:
             QMessageBox.warning(
                 self, self.tr("File is too large"),
                 i18n.fmt(
                     self.tr("Files are limited to %(mb)s MB."),
-                    mb=envelope.MAX_FILE_BYTES // (1024 * 1024),
+                    mb=envelope.MAX_TRANSFER_BYTES // (1024 * 1024),
                 ),
             )
+            return
+
+        mime, _encoding = mimetypes.guess_type(path)
+        mime = mime or "application/octet-stream"
+
+        # A file over MAX_FILE_BYTES always goes out chunked (see
+        # ChunkedSendWorker) - never read fully into memory up front for
+        # that path (a multi-GB file would otherwise be loaded whole
+        # before a single byte goes out, exactly the memory-use problem
+        # chunking exists to avoid). The image-recompression prompt
+        # below only applies to the small, single-shot path - a large
+        # image is sent as-is, chunked, with no recompression choice
+        # (recompressing would require decoding the whole thing into
+        # memory anyway, defeating the point).
+        if size > envelope.MAX_FILE_BYTES:
+            if target_group is not None:
+                self._start_group_chunked_send(target_group, path, mime, size)
+            elif target_contact is not None:
+                self._start_contact_chunked_send(target_contact, path, mime, size)
             return
 
         try:
@@ -2987,9 +3209,6 @@ class MainWindow(QMainWindow):
                 safe_error_text(exc, self.tr("Could not read that file.")),
             )
             return
-
-        mime, _encoding = mimetypes.guess_type(path)
-        mime = mime or "application/octet-stream"
 
         if mime.startswith("image/"):
             original_mime = mime
@@ -3129,6 +3348,157 @@ class MainWindow(QMainWindow):
         if self._active_contact_id == sent_to_id:
             self._render_conversation(self.vault.get_contact(sent_to_id))
 
+    def _start_contact_chunked_send(
+        self, contact: vault_mod.Contact, file_path: str, mime: str, total_size: int,
+    ) -> None:
+        """
+        Large-file (over envelope.MAX_FILE_BYTES) counterpart to
+        _start_contact_file_send - see ChunkedSendWorker's docstring for
+        the actual chunk-by-chunk send mechanics. Shows a placeholder
+        attachment bubble immediately (same "appears right away, fills
+        in as it goes" pattern the group-invite onboarding flow already
+        established), then launches the worker for every chunk this
+        transfer doesn't already have marked done (empty set for a
+        brand-new send - see DeliveryWorker's resume path for the
+        non-empty case).
+        """
+        chunk_count = -(-total_size // envelope.CHUNK_SIZE)  # ceiling division
+        client_msg_id = str(uuid.uuid4())
+        # Generated ONCE and reused for both the wire announcement and
+        # the local FileTransfer record below - these must be the exact
+        # same id, since every chunk (sent using the LOCAL record's id,
+        # see _launch_chunked_send_worker) has to match what
+        # KIND_FILE_START told the receiver to expect. Two independently
+        # generated ids here (one baked into the wire message, a
+        # different one used locally) would mean the receiver's
+        # KIND_FILE_START-created transfer and the chunks that actually
+        # arrive tagged with the OTHER id never line up - each chunk
+        # would then look like it belongs to an unrecognized transfer and
+        # get handled by _on_file_chunk's own implicit-start fallback
+        # instead, creating a second, separate (and wrongly-named)
+        # Message/FileTransfer alongside the first.
+        transfer_id = str(uuid.uuid4())
+
+        try:
+            start_wire = envelope.encode_file_start(
+                transfer_id, os.path.basename(file_path), mime, total_size, chunk_count,
+                mid=client_msg_id,
+            )
+        except envelope.EnvelopeError as exc:
+            QMessageBox.warning(self, self.tr("Could not send file"), str(exc))
+            return
+        start_env = envelope.decode(start_wire)  # sanitized filename/mime, matches what is actually sent
+
+        transfer = self.vault.start_file_transfer(
+            contact.id, "out", start_env.filename, start_env.mime, total_size, chunk_count,
+            group_id="", client_msg_id=client_msg_id, source_path=file_path, transfer_id=transfer_id,
+        )
+
+        msg = self.vault.add_message(
+            contact.id, direction="out", body="", delivered=False, status=vault_mod.QUEUED,
+            attachment_filename=start_env.filename, attachment_mime=start_env.mime,
+            attachment_size=total_size, client_msg_id=client_msg_id,
+        )
+        self._pending_file_message_id = msg.id if msg is not None else None
+
+        self._reload_contacts(select_id=self._active_contact_id)
+        if self._active_contact_id == contact.id:
+            self._render_conversation(self.vault.get_contact(contact.id))
+
+        # start_wire is sent from inside ChunkedSendWorker's background
+        # thread (see its docstring), not synchronously here on the UI
+        # thread - a stalled connection to a contact who just went
+        # offline could otherwise block the UI for up to
+        # transport.CONNECT_TIMEOUT seconds on every single large-file
+        # send, which is worse than the same risk for the rare
+        # group-leave/ack control sends that already accept it.
+        self._launch_chunked_send_worker(transfer, contact, file_path, start_wire=start_wire)
+
+    def _launch_chunked_send_worker(
+        self, transfer: vault_mod.FileTransfer, contact: vault_mod.Contact, file_path: str,
+        start_wire: str | None = None,
+    ) -> None:
+        identity = self.vault.identity
+        assert identity is not None
+        already_done = {i for i, done in enumerate(transfer.chunks_done) if done}
+        worker = ChunkedSendWorker(
+            transfer_id=transfer.id, file_path=file_path, chunk_count=transfer.chunk_count,
+            already_done=already_done, onion=contact.onion, their_public_b64=contact.public_key,
+            my_private=self.vault.private_key_raw(), my_public_b64=identity.public_key,
+            my_onion=identity.onion, socks_port=self.tor.socks_port, start_wire=start_wire,
+        )
+        self._chunked_send_workers[transfer.id] = worker
+        worker.progress.connect(self._on_chunk_progress)
+        worker.done.connect(self._on_chunked_send_done)
+        worker.finished.connect(lambda: self._release_chunked_send_worker(transfer.id))
+        worker.start()
+
+    def _on_chunk_progress(self, transfer_id: str, chunk_index: int) -> None:
+        self.vault.mark_chunk_done(transfer_id, chunk_index)
+        transfer = self.vault.get_file_transfer(transfer_id)
+        if transfer is None:
+            return
+        if self._active_contact_id == transfer.contact_id:
+            self._render_conversation(self.vault.get_contact(transfer.contact_id))
+        elif self._active_group_id == transfer.group_id and transfer.group_id:
+            group = self.vault.get_group(transfer.group_id)
+            if group is not None:
+                self._render_conversation(None, group=group)
+
+    def _on_chunked_send_done(self, transfer_id: str, success: bool, error: str) -> None:
+        transfer = self.vault.get_file_transfer(transfer_id)
+        if transfer is None:
+            return
+        contact = self.vault.get_contact(transfer.contact_id)
+        if success and transfer.completed:
+            # Fold the completed attachment into the placeholder Message
+            # exactly like the single-shot KIND_FILE path already does -
+            # the finished-attachment storage model (base64 inside an
+            # encrypted Message) is unchanged; only how the bytes got
+            # here is new. The outgoing side already has the full file on
+            # disk at its original path throughout, so re-reading it here
+            # (rather than the .part-file path used on the receiving
+            # side) is correct and simpler.
+            for msg in (contact.messages if contact else []):
+                if msg.client_msg_id == transfer.client_msg_id and msg.direction == "out":
+                    self.vault.mark_message(transfer.contact_id, msg.id, vault_mod.SENT, "")
+                    break
+            self.vault.discard_file_transfer(transfer_id)
+        elif not success:
+            if self.delivery is not None:
+                self.delivery.wake()  # DeliveryWorker resumes the remaining chunks once back online
+
+        if contact is not None:
+            self._reload_contacts(select_id=self._active_contact_id)
+            if self._active_contact_id == transfer.contact_id:
+                self._render_conversation(self.vault.get_contact(transfer.contact_id))
+
+    def _release_chunked_send_worker(self, transfer_id: str) -> None:
+        worker = self._chunked_send_workers.pop(transfer_id, None)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _on_resume_transfer(self, transfer_id: str) -> None:
+        """
+        DeliveryWorker detected an incomplete outgoing transfer to a
+        contact who just came back online (see DeliveryWorker.resume_transfer's
+        docstring) - relaunch ChunkedSendWorker for just the remaining
+        chunks. A transfer already being actively sent (still in
+        self._chunked_send_workers) is left alone rather than launching
+        a second worker for the same transfer in parallel.
+        """
+        if transfer_id in self._chunked_send_workers:
+            return
+        transfer = self.vault.get_file_transfer(transfer_id)
+        if transfer is None or transfer.completed or transfer.direction != "out":
+            return
+        if not transfer.source_path or not os.path.exists(transfer.source_path):
+            return  # the original file moved/was deleted - nothing to resume with
+        contact = self.vault.get_contact(transfer.contact_id)
+        if contact is None:
+            return
+        self._launch_chunked_send_worker(transfer, contact, transfer.source_path)
+
     # -- Receiving ---------------------------------------------------------- #
     def _on_incoming(self, message: transport.IncomingMessage) -> None:
         """Called on a network thread - hand off to the UI thread immediately."""
@@ -3143,15 +3513,37 @@ class MainWindow(QMainWindow):
             return  # Blocked after acceptance but before delivery.
 
         if contact.status == vault_mod.STATUS_PENDING:
-            # Unchanged from before group/file support existed: a
-            # stranger's first message is stored as plain text on the
-            # pending request record. Envelope/group/file framing is only
-            # trusted once the user has actually accepted this sender as a
-            # contact - a pending sender does not get to auto-join a group
-            # or land a "file" bubble in the UI before that decision is
-            # made (contact.name already carries any impersonation warning
-            # _add_pending attached - see vault.py).
-            self.vault.add_message(contact.id, direction="in", body=body)
+            # A stranger's first message still needs its envelope peeled
+            # off before display - `body` is real wire JSON (see
+            # envelope.py: kind/mid/gid/the padding field, etc.) for every
+            # sender now, not just accepted ones, so storing it verbatim
+            # here used to leak that raw JSON straight into the request
+            # preview/thread instead of the actual text. Only plain
+            # display text is ever taken from it: group/file/delete/
+            # invite framing is NOT trusted or acted on until the user
+            # has actually accepted this sender as a contact - a pending
+            # sender does not get to auto-join a group or land a real
+            # "file" bubble in the UI before that decision is made
+            # (contact.name already carries any impersonation warning
+            # _add_pending attached - see vault.py). A KIND_FILE's body
+            # is base64 file bytes, not text - shown as a neutral
+            # placeholder rather than dumping raw base64 into the thread,
+            # since nothing here decodes or stores the actual attachment
+            # before acceptance either.
+            try:
+                env = envelope.decode(body)
+            except envelope.EnvelopeError:
+                display_text = ""
+            else:
+                if env.kind == envelope.KIND_TEXT:
+                    display_text = env.body
+                elif env.kind in (envelope.KIND_FILE, envelope.KIND_FILE_START):
+                    display_text = self.tr("[Sent a file - accept this contact to view it]")
+                elif env.kind == envelope.KIND_FILE_CHUNK:
+                    return  # one chunk of an already-refused transfer - nothing new to show
+                else:
+                    display_text = ""  # a delete/ack/leave control envelope has nothing to show
+            self.vault.add_message(contact.id, direction="in", body=display_text)
             self._reload_contacts(select_id=self._active_contact_id)
             return
 
@@ -3193,6 +3585,19 @@ class MainWindow(QMainWindow):
                 self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
                 if self._active_group_id == group.id:
                     self._render_conversation(None, group=group)
+            return
+
+        if env.kind == envelope.KIND_FILE_START:
+            self._on_file_start(contact, env)
+            self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+            if self._active_contact_id == contact.id:
+                self._render_conversation(self.vault.get_contact(contact.id))
+            return
+
+        if env.kind == envelope.KIND_FILE_CHUNK:
+            self._on_file_chunk(contact, env)
+            if self._active_contact_id == contact.id:
+                self._render_conversation(self.vault.get_contact(contact.id))
             return
 
         if env.gid:
@@ -3259,6 +3664,124 @@ class MainWindow(QMainWindow):
                 return self.vault.get_group(message.group_id)
             return None
         return None
+
+    def _on_file_start(self, contact: vault_mod.Contact, env: envelope.Envelope) -> None:
+        """
+        A sender announced a chunked transfer (see envelope.KIND_FILE_START).
+        Creates the FileTransfer record and an immediately-visible
+        placeholder Message bubble ("Receiving... 0%") - the same
+        "appears right away, fills in as it goes" pattern the sending
+        side uses. Idempotent: a duplicate/retried KIND_FILE_START for a
+        transfer_id already on file (e.g. the sender's own retry logic
+        resent it) is a no-op, not a second transfer.
+
+        Enforces MAX_ATTACHMENT_BYTES_PER_CONTACT up front, before a
+        single chunk is accepted - cheap to check now (env.size is
+        already internally cross-checked against chunk_count by
+        envelope.decode(), though still just a CLAIMED total; the real
+        enforcement that bounds actual bytes accepted is unchanged and
+        happens in vault.add_message() once the transfer completes, this
+        is purely an early-reject optimization so this vault does not
+        spend bandwidth/disk on a transfer it will refuse to store
+        anyway).
+        """
+        if self.vault.get_file_transfer(env.transfer_id) is not None:
+            return
+        existing = sum(
+            m.attachment_size for m in contact.messages
+            if m.direction == "in" and m.attachment_filename and not m.deleted
+        )
+        if existing + env.size > vault_mod.MAX_ATTACHMENT_BYTES_PER_CONTACT:
+            _logger.warning(
+                "Refusing an incoming chunked transfer: contact %s would exceed "
+                "the per-contact attachment cap", contact.id,
+            )
+            return
+
+        client_msg_id = env.mid or str(uuid.uuid4())
+        transfer = self.vault.start_incoming_file_transfer(
+            env.transfer_id, contact.id, env.filename, env.mime,
+            env.size, env.chunk_count, client_msg_id,
+        )
+        if transfer is None:
+            return
+
+        self.vault.add_message(
+            contact.id, direction="in", body="", attachment_filename=env.filename,
+            attachment_mime=env.mime, attachment_size=env.size, client_msg_id=transfer.client_msg_id,
+        )
+
+    def _on_file_chunk(self, contact: vault_mod.Contact, env: envelope.Envelope) -> None:
+        """
+        One chunk of a transfer (see envelope.KIND_FILE_CHUNK). Tolerates
+        a chunk arriving with no prior KIND_FILE_START on file (lost/
+        reordered network delivery, or simply a peer running code that
+        never sends file_start) by starting the transfer implicitly on
+        the first chunk seen for an unrecognized transfer_id - filename
+        is unknown in that case (env carries none), so a generic
+        placeholder name is used; MAX_ATTACHMENT_BYTES_PER_CONTACT is
+        still enforced, using chunk_count * CHUNK_SIZE as the size
+        estimate since no claimed total exists yet.
+
+        Chunks are only accepted in order (index == the next expected
+        one) - an out-of-order chunk is dropped, since
+        Vault.append_incoming_chunk() can only append to the end of the
+        .part file, and would silently corrupt the assembled file if
+        chunks landed in the wrong sequence. Not a correctness gap in
+        practice: transport.py delivers over a single ordered TCP stream
+        per connection, and ChunkedSendWorker sends strictly in index
+        order - out-of-order arrival would mean something is already
+        badly wrong (a forged/replayed chunk, or a peer not following
+        this protocol), so dropping it is the safe response, same as any
+        other malformed/unexpected input in this codebase.
+        """
+        transfer = self.vault.get_file_transfer(env.transfer_id)
+        if transfer is None:
+            existing = sum(
+                m.attachment_size for m in contact.messages
+                if m.direction == "in" and m.attachment_filename and not m.deleted
+            )
+            estimated_size = env.chunk_count * envelope.CHUNK_SIZE
+            if existing + estimated_size > vault_mod.MAX_ATTACHMENT_BYTES_PER_CONTACT:
+                _logger.warning(
+                    "Refusing an incoming chunked transfer with no file_start: "
+                    "contact %s would exceed the per-contact attachment cap", contact.id,
+                )
+                return
+            transfer = self.vault.start_incoming_file_transfer(
+                env.transfer_id, contact.id, self.tr("file"), "application/octet-stream",
+                estimated_size, env.chunk_count, str(uuid.uuid4()),
+            )
+            if transfer is None:
+                return
+            self.vault.add_message(
+                contact.id, direction="in", body="", attachment_filename=transfer.filename,
+                attachment_mime=transfer.mime, attachment_size=transfer.total_size,
+                client_msg_id=transfer.client_msg_id,
+            )
+
+        if transfer.contact_id != contact.id or transfer.direction != "in":
+            return  # a chunk claiming a transfer_id that belongs to someone else - dropped
+        if transfer.chunk_count != env.chunk_count or env.chunk_index >= transfer.chunk_count:
+            return
+        if transfer.chunks_done[env.chunk_index]:
+            return  # already have this one (a resent/duplicate chunk) - no-op, not an error
+
+        next_expected = transfer.chunks_done_count
+        if env.chunk_index != next_expected:
+            return  # out of order - see docstring above on why this is dropped, not buffered
+
+        try:
+            chunk_bytes = base64.b64decode(env.body)
+        except Exception:
+            return
+
+        self.vault.append_incoming_chunk(transfer.id, chunk_bytes)
+        self.vault.mark_chunk_done(transfer.id, env.chunk_index)
+
+        transfer = self.vault.get_file_transfer(transfer.id)
+        if transfer is not None and transfer.completed:
+            self.vault.complete_incoming_transfer(transfer.id)
 
     def _file_incoming_group_message(
         self, sender: vault_mod.Contact, env: envelope.Envelope,

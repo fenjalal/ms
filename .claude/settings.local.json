@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"import ast; ast.parse\\(open\\('vault.py'\\).read\\(\\)\\)\")"
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('vault.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

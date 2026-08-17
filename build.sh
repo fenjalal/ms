@@ -84,7 +84,7 @@ run_tests() {
         test_keys.py test_ui.py test_offline.py test_vault_concurrency.py
         test_shutdown.py test_bundle.py test_i18n.py test_delete.py
         test_envelope.py test_groups_and_files.py test_group_invite.py
-        test_group_onboarding.py
+        test_group_onboarding.py test_chunked_transfer.py
     )
     (
         cd "$REPO_ROOT"
