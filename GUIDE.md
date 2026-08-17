@@ -71,14 +71,43 @@ is rejected. Your onion address is never shown anywhere else in the app —
 only inside this bundle, so a screenshot of your contact list or a
 shoulder-surf never leaks it.
 
-Send this bundle only to people you actually want to be reachable by.
+Send this bundle only to people you actually want to be reachable by —
+paste it into a message, a QR code scan, however you'd normally share
+something with that person.
 
-**On the receiving end**, someone adds you by clicking **Add**, pasting
-the bundle you sent, and giving you a local name. If your address ever
-changes (e.g. you restored from a backup on a new machine), their app
-will flag it as an "Identity / Endpoint Changed" warning rather than
-silently trusting the new address — they have to explicitly confirm your
-fingerprint again before continuing.
+### What to send, and what NOT to send
+
+The **Keys** dialog (see the next section) also has **"Copy public key"**
+and **"Copy fingerprint"** buttons. These are for *verification*, not for
+adding someone — a bare public key on its own has no address attached to
+it, so nobody can connect to you with it alone. Concretely:
+
+| What you copy | Looks like | Enough to add you? |
+|---|---|---|
+| **Share Contact** bundle | `P2PMSG1:AbCd...` | **Yes** — this is the one to send |
+| Public key alone | `w_zLeEaPZ20LLQz_DIYSsxinpQqjU2h2TFHPZA4mK1Q` | No — no address attached |
+| Fingerprint alone | `9A63 EDE8 FE3C 5AFB CFAB` | No — this is for verifying, read aloud to compare |
+
+If you paste just the public key into the "Add Contact" box, it will be
+rejected — the app needs either a full `P2PMSG1:...` bundle or the older
+plaintext `onionmsg:<onion>:<public key>` form, both of which carry an
+address, not just a key.
+
+### Adding someone who sent you their bundle
+
+Click **Add**, then paste what they sent you:
+
+![Paste a contact bundle](docs/guide-screenshots/04b_add_contact_paste.png)
+
+You'll then be asked for a local name to remember them by — this name is
+private to you; it isn't sent anywhere:
+
+![Name the contact](docs/guide-screenshots/04c_add_contact_name.png)
+
+If their address ever changes later (e.g. they restored from a backup on
+a new machine), your app will flag it as an "Identity / Endpoint Changed"
+warning rather than silently trusting the new address — you'll need to
+explicitly confirm their fingerprint again before continuing.
 
 ---
 

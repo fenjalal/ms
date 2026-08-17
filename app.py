@@ -745,6 +745,12 @@ class IdentityDialog(QDialog):
 
         copy_row = QHBoxLayout()
         copy_key = QPushButton(self.tr("Copy public key"))
+        copy_key.setToolTip(
+            self.tr(
+                "For verification only - this alone is not enough for someone "
+                "to add you. Use Share Contact to actually let someone connect."
+            )
+        )
         copy_key.clicked.connect(
             lambda: self._copy(identity.public_key, self.tr("Public key copied."))
         )
