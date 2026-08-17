@@ -521,10 +521,6 @@ class Vault:
     def exists(self) -> bool:
         return os.path.exists(self.path)
 
-    @property
-    def is_locked(self) -> bool:
-        return self._key is None
-
     def create(self, passphrase: str) -> None:
         """Create a brand new vault with a fresh identity."""
         with self._lock:
@@ -850,10 +846,6 @@ class Vault:
                 if g.id == group_id:
                     return g
             return None
-
-    def sorted_groups(self) -> list[Group]:
-        with self._lock:
-            return sorted(self.groups, key=lambda g: self.group_last_activity(g), reverse=True)
 
     def group_last_activity(self, group: Group) -> str:
         """

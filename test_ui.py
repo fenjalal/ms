@@ -13,7 +13,6 @@ contrast against its own background.
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 from PySide6.QtGui import QColor, QIcon, QPalette
@@ -389,7 +388,6 @@ def main() -> None:
     icon = appmod.icon_file()
     check("icon file bundled", icon is not None and os.path.exists(icon))
     if icon:
-        from PySide6.QtGui import QIcon
         check("icon loads as a real image", not QIcon(icon).isNull())
 
     print("\nAbout dialog:")

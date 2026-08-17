@@ -87,13 +87,26 @@ class Peer:
             return
 
         if env.gid:
+            # Mirrors app.py's MainWindow._file_incoming_group_message /
+            # test_groups_and_files.py's Peer._receive: a group this peer
+            # has no local record of at all (never created it, never
+            # redeemed an invite for it) is unrecognized and dropped, not
+            # auto-created - create_group_from_invite() was removed when
+            # invite-gated group joining replaced the old "any accepted
+            # contact auto-joins" behavior (see vault.join_group_from_invite/
+            # redeem_group_invite_locally). This test file has no group-
+            # invite flow of its own to exercise, so an unrecognized gid
+            # here is always dropped - the delete-related group tests in
+            # this file (see main()) create their groups directly via
+            # vault.create_group(), not through this wire path.
             group = self.vault.get_group(env.gid)
             if group is None:
-                group = self.vault.create_group_from_invite(
-                    env.gid, env.gname or "Group", contact.id,
-                )
-            elif contact.id not in group.member_contact_ids:
-                self.vault.add_group_member(group.id, contact.id)
+                return
+            if contact.id not in group.member_contact_ids:
+                try:
+                    self.vault.add_group_member(group.id, contact.id)
+                except ValueError:
+                    pass
             kwargs = dict(
                 contact_id=contact.id, direction="in", group_id=group.id,
                 sender_contact_id=contact.id, client_msg_id=env.mid,
@@ -189,7 +202,6 @@ def main() -> None:
 
     print("\nrender_bubble: tombstone and Delete-link presentation:")
     import app as appmod
-    import theme
 
     class FakeTheme:
         bubble_out_bg = "#1a1a1a"
@@ -267,8 +279,6 @@ def main() -> None:
 
     ali_c = tamer.vault.add_contact("Ali", ali.address)
     tamer_c_at_ali = ali.vault.add_contact("Tamer", tamer.address)
-    eve_c = tamer.vault.add_contact("Eve", eve.address)
-    tamer_c_at_eve = eve.vault.add_contact("Tamer", tamer.address)
 
     print("Delete for everyone, over the wire:")
     mid = "wire-mid-1"
