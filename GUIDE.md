@@ -210,6 +210,59 @@ to be from the Veilwire project itself is genuine.
 
 ---
 
+## 11. Uninstalling
+
+Removing Veilwire only removes Veilwire — the package only ever installs
+files under `/usr/bin/veilwire`, `/usr/lib/veilwire/`, and a handful of
+standard desktop-entry/icon files under `/usr/share/`. It never touches
+any other application, and it does **not** delete your identity or
+message history automatically — that's a deliberate safety choice, in
+case you're reinstalling or switching to a different package format and
+want to keep using the same vault.
+
+Pick the command that matches how you installed it:
+
+| Installed via | Uninstall command |
+|---|---|
+| `.deb` (Debian/Ubuntu/Kali) | `sudo dpkg -r veilwire` |
+| `.rpm` (Fedora) | `sudo rpm -e veilwire` |
+| Arch/`.pkg.tar.zst` | `sudo pacman -R veilwire` |
+| AppImage | Just delete the `.AppImage` file — it's a single portable file, nothing was installed anywhere else |
+| Flatpak | `flatpak uninstall com.veilwire.Veilwire` |
+
+After any of these, the app itself is gone, but your data is still there:
+
+```
+~/.local/share/veilwire/     # your encrypted vault, Tor state
+~/.config/veilwire/          # your language/settings preference
+```
+
+**To also delete your identity, contacts, and message history**, remove
+that data directory yourself — this step is irreversible, so only do it
+if you're sure:
+
+```
+rm -rf ~/.local/share/veilwire ~/.config/veilwire
+```
+
+**If you installed via Flatpak**, your data lives in a sandboxed location
+instead: `~/.var/app/com.veilwire.Veilwire/` (with `data`, `config`, and
+`cache` subdirectories inside it). `flatpak uninstall` alone leaves this
+in place, same reasoning as above. To remove both the app and this data
+in one step:
+
+```
+flatpak uninstall --delete-data com.veilwire.Veilwire
+```
+
+or manually, after an ordinary `flatpak uninstall com.veilwire.Veilwire`:
+
+```
+rm -rf ~/.var/app/com.veilwire.Veilwire
+```
+
+---
+
 ## Good habits
 
 - **Verify fingerprints out of band** (a call, in person, an existing
