@@ -1,4 +1,4 @@
-# onionmsg v0.0.1
+# Veilwire v1.0.0
 
 *Open source (MIT). Alpha  see Limitations before relying on it.*
 
