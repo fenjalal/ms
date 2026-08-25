@@ -150,11 +150,10 @@ build_deb() {
         echo "SKIPPED: deb (dpkg-deb/fakeroot not installed - sudo apt install dpkg-dev fakeroot)"
         return 1
     fi
-    "$REPO_ROOT/packaging/debian/build.sh"
+    "$REPO_ROOT/packaging/debian/build.sh" || return 1
     local version
     version="$(python3 -c 'import version; print(version.__version__)')"
     validate_deb "$DIST_DIR/veilwire_${version}_amd64.deb"
-    return 0
 }
 
 build_rpm() {
@@ -164,7 +163,6 @@ build_rpm() {
         return 1
     fi
     "$REPO_ROOT/packaging/rpm/build.sh"
-    return 0
 }
 
 build_arch() {
@@ -174,7 +172,6 @@ build_arch() {
         return 1
     fi
     "$REPO_ROOT/packaging/arch/build.sh"
-    return 0
 }
 
 build_appimage() {
@@ -193,7 +190,6 @@ build_flatpak() {
         return 1
     fi
     "$REPO_ROOT/packaging/flatpak/build.sh"
-    return 0
 }
 
 write_checksums() {

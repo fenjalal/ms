@@ -46,6 +46,17 @@ mkdir -p "$BUILD_DIR/staging"
 cp "$REPO_ROOT/packaging/common/veilwire.desktop" "$BUILD_DIR/staging/veilwire.desktop"
 cp "$REPO_ROOT/packaging/common/veilwire-launcher.sh" "$BUILD_DIR/staging/packaging-launcher.sh"
 
+# The manifest's build-commands run `pip3 install --no-index
+# --find-links=file://.../python-deps` INSIDE the Flatpak sandbox, which
+# has no network access during the build by design (that's what makes a
+# Flatpak build reproducible). So the wheels have to be fetched here, on
+# the host, before flatpak-builder ever starts - same version floors as
+# requirements.txt (the single dependency source of truth), matching what
+# the manifest already declares.
+mkdir -p "$BUILD_DIR/staging/python-deps"
+pip3 download --dest "$BUILD_DIR/staging/python-deps" \
+    "PySide6>=6.6" "PyNaCl>=1.5" "stem>=1.8" "PySocks>=1.7" "segno>=1.6"
+
 MANIFEST="$BUILD_DIR/com.veilwire.Veilwire.yml"
 sed "s|path: ../..|path: staging|" "$REPO_ROOT/packaging/flatpak/com.veilwire.Veilwire.yml" > "$MANIFEST"
 
