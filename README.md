@@ -208,7 +208,7 @@ flatpak install --user ./Veilwire-1.0.0-x86_64.flatpak
 ### From source (development)
 
 ```bash
-git clone <your-repo-url> veilwire
+git clone https://github.com/fenjalal/ms veilwire
 cd veilwire
 python3 -m venv .venv
 source .venv/bin/activate
