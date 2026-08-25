@@ -148,6 +148,15 @@ class EnvelopeError(Exception):
 
 
 MAX_INVCODE_CHARS = 64
+# A full signed group_invite.py invite (P2PGRP1:<base64 of gid/gname/
+# code/expires/owner_onion/owner_public_key/owner_signing_public_key +
+# signature>) is far bigger than a bare code - a real one with a short
+# group name already runs ~540 bytes, and a longer group name pushes
+# that further. Sized with generous headroom (well beyond what any
+# reasonable gname produces) while still being a firm, documented
+# ceiling - the same "generous but bounded" rule MAX_BODY_CHARS etc.
+# already follow.
+MAX_INVITE_CHARS = 4000
 
 
 @dataclass
@@ -168,6 +177,19 @@ class Envelope:
     # set for a group this vault owns/created itself - an owner's own
     # messages need no invite code, they were never invited.
     invcode: str = ""
+    # KIND_TEXT/KIND_FILE only, and only on the FIRST message(s) sent to
+    # a newly-added member who does not yet have their own local Group
+    # record (see vault.Group.pending_onboard_contact_ids and app.py's
+    # _start_group_send) - the FULL signed group_invite.py invite text
+    # (not just its bare code, unlike invcode above), so the recipient's
+    # app can call vault.join_group_from_invite() on it automatically the
+    # moment this envelope arrives, without the user having to separately
+    # request/copy/paste an invite through the manual "Join Group..."
+    # flow. Cleared (recipient stops needing it) once their own Group
+    # record exists locally - see app.py's onboarding-clear logic, mirror
+    # of how invcode above stops being attached once KIND_GROUP_ACK
+    # confirms membership.
+    invite: str = ""
     # KIND_FILE_START/KIND_FILE_CHUNK only: the transfer these belong to
     # (see vault.FileTransfer). filename/mime/size on a KIND_FILE_START
     # describe the WHOLE file (reusing the same field names/semantics as
@@ -230,6 +252,7 @@ def _pad(payload: dict) -> str:
 
 def encode_text(
     body: str, gid: str = "", gname: str = "", mid: str = "", invcode: str = "",
+    invite: str = "",
 ) -> str:
     if len(body) > MAX_BODY_CHARS:
         raise EnvelopeError("Message is too long.")
@@ -241,12 +264,14 @@ def encode_text(
         payload["mid"] = mid[:MAX_MID_CHARS]
     if invcode:
         payload["invcode"] = invcode[:MAX_INVCODE_CHARS]
+    if invite:
+        payload["invite"] = invite[:MAX_INVITE_CHARS]
     return _pad(payload)
 
 
 def encode_file(
     filename: str, mime: str, data: bytes, gid: str = "", gname: str = "", mid: str = "",
-    invcode: str = "",
+    invcode: str = "", invite: str = "",
 ) -> str:
     if len(data) > MAX_FILE_BYTES:
         raise EnvelopeError(
@@ -266,6 +291,8 @@ def encode_file(
         payload["mid"] = mid[:MAX_MID_CHARS]
     if invcode:
         payload["invcode"] = invcode[:MAX_INVCODE_CHARS]
+    if invite:
+        payload["invite"] = invite[:MAX_INVITE_CHARS]
     return _pad(payload)
 
 
@@ -430,6 +457,11 @@ def decode(plaintext: str) -> Envelope:
         raise EnvelopeError("Malformed envelope.")
     invcode = invcode[:MAX_INVCODE_CHARS]
 
+    invite = parsed.get("invite") or ""
+    if not isinstance(invite, str):
+        raise EnvelopeError("Malformed envelope.")
+    invite = invite[:MAX_INVITE_CHARS]
+
     if kind == KIND_DELETE:
         if not mid:
             raise EnvelopeError("Malformed delete envelope.")
@@ -449,7 +481,10 @@ def decode(plaintext: str) -> Envelope:
         body = parsed.get("body")
         if not isinstance(body, str) or len(body) > MAX_BODY_CHARS:
             raise EnvelopeError("Malformed text envelope.")
-        return Envelope(kind=KIND_TEXT, body=body, gid=gid, gname=gname, mid=mid, invcode=invcode)
+        return Envelope(
+            kind=KIND_TEXT, body=body, gid=gid, gname=gname, mid=mid,
+            invcode=invcode, invite=invite,
+        )
 
     if kind == KIND_FILE_START:
         filename = parsed.get("filename")
@@ -558,4 +593,5 @@ def decode(plaintext: str) -> Envelope:
         size=decoded_size,
         mid=mid,
         invcode=invcode,
+        invite=invite,
     )

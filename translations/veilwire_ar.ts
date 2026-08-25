@@ -866,13 +866,13 @@ Compare this fingerprint with them over a channel you trust.</source>
     </message>
     <message>
         <location filename="../app.py" line="2498" />
-        <source> — online</source>
-        <translation> — متصل</translation>
+        <source>  online</source>
+        <translation>  متصل</translation>
     </message>
     <message>
         <location filename="../app.py" line="2500" />
-        <source> — offline</source>
-        <translation> — غير متصل</translation>
+        <source>  offline</source>
+        <translation>  غير متصل</translation>
     </message>
     <message>
         <location filename="../app.py" line="2514" />

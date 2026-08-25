@@ -18,13 +18,14 @@ import io
 import logging
 import os
 import mimetypes
+import secrets
 import sys
 import threading
 import uuid
 from datetime import datetime
 
 import segno
-from PySide6.QtCore import QBuffer, QByteArray, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QBuffer, QByteArray, QPoint, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -639,6 +640,65 @@ class HealthMonitor(QThread):
         self.status.emit("ok", "Online and reachable.")
 
 
+def _copy_icon(color: str) -> QIcon:
+    """
+    A small "copy" glyph (two overlapping rounded rectangles), drawn with
+    QPainter rather than taken from a Unicode character. A text glyph
+    (clipboard emoji, or any of several "copy" symbol-block characters)
+    was tried first and rejected: whether a given Unicode code point
+    actually has a visible glyph depends entirely on which fonts happen
+    to be installed, and this was verified empirically to render as an
+    unrecognizable placeholder/tofu box on a real test system - drawing
+    the icon directly guarantees the same correct appearance everywhere,
+    with no font-fallback dependency at all.
+    """
+    size = 16
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = painter.pen()
+    pen.setColor(QColor(color))
+    pen.setWidth(1)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    # Back rectangle (partially hidden behind the front one) then the
+    # front rectangle, offset down-right - the standard "duplicate" icon
+    # shape used across most desktop icon sets.
+    painter.drawRoundedRect(2, 2, 10, 10, 2, 2)
+    painter.drawRoundedRect(5, 5, 10, 10, 2, 2)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _chevron_icon(color: str, pointing_left: bool) -> QIcon:
+    """
+    A simple "‹"/"›" chevron, drawn with QPainter rather than taken from
+    a Unicode character - same reasoning and same font-fallback failure
+    mode already documented on _copy_icon above (verified empirically:
+    those exact glyphs rendered as an empty box on this system's default
+    button font). Used for the sidebar collapse/expand toggle.
+    """
+    size = 16
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = painter.pen()
+    pen.setColor(QColor(color))
+    pen.setWidth(2)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    if pointing_left:
+        points = [(10, 3), (5, 8), (10, 13)]
+    else:
+        points = [(6, 3), (11, 8), (6, 13)]
+    painter.drawPolyline([QPoint(x, y) for x, y in points])
+    painter.end()
+    return QIcon(pixmap)
+
+
 class SelfTestWorker(QThread):
     """Connects to our own onion address through Tor to prove reachability."""
 
@@ -691,6 +751,32 @@ class IdentityDialog(QDialog):
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
+        # Each field sits in its own row with a small icon-only copy
+        # button right next to it, matched to the field's own height -
+        # replaces the old separate "Copy public key"/"Copy fingerprint"
+        # text buttons underneath, which repeated words already on
+        # screen (the field's own label) for no benefit. Uses _copy_icon()
+        # (a drawn vector icon) rather than a Unicode glyph - see that
+        # function's docstring for why: a text glyph's actual appearance
+        # depends on which fonts happen to be installed, and this was
+        # verified to render as an unrecognizable placeholder on a real
+        # test system for every Unicode "copy" candidate tried.
+        copy_icon = _copy_icon(theme.detect_palette(QApplication.instance()).text)
+
+        def _field_with_copy_button(field: QLineEdit, value: str, copied_text: str) -> QWidget:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(field)
+            copy_btn = QPushButton()
+            copy_btn.setIcon(copy_icon)
+            copy_btn.setFixedSize(field.sizeHint().height(), field.sizeHint().height())
+            copy_btn.setToolTip(self.tr("Copy"))
+            copy_btn.clicked.connect(lambda: self._copy(value, copied_text))
+            row_layout.addWidget(copy_btn)
+            return row
+
         self.pubkey_field = QLineEdit(identity.public_key)
         self.pubkey_field.setReadOnly(True)
         # Monospace so every character of a base64 key renders at the same
@@ -704,7 +790,16 @@ class IdentityDialog(QDialog):
         # instead of its start - looks like the field is showing garbage
         # or cut off. Same fix already applied to my_address elsewhere.
         self.pubkey_field.setCursorPosition(0)
-        form.addRow(self.tr("Public key"), self.pubkey_field)
+        self.pubkey_field.setToolTip(
+            self.tr(
+                "For verification only - this alone is not enough for someone "
+                "to add you. Use Share Contact to actually let someone connect."
+            )
+        )
+        form.addRow(
+            self.tr("Public key"),
+            _field_with_copy_button(self.pubkey_field, identity.public_key, self.tr("Public key copied.")),
+        )
 
         fingerprint_font = QFont("monospace")
         fingerprint_font.setBold(True)
@@ -715,7 +810,10 @@ class IdentityDialog(QDialog):
         self.fingerprint_field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.fingerprint_field.setMinimumWidth(0)
         self.fingerprint_field.setCursorPosition(0)
-        form.addRow(self.tr("Fingerprint"), self.fingerprint_field)
+        form.addRow(
+            self.tr("Fingerprint"),
+            _field_with_copy_button(self.fingerprint_field, identity.fingerprint, self.tr("Fingerprint copied.")),
+        )
 
         layout.addLayout(form)
 
@@ -742,26 +840,6 @@ class IdentityDialog(QDialog):
         )
         share_button.clicked.connect(self._on_share)
         layout.addWidget(share_button)
-
-        copy_row = QHBoxLayout()
-        copy_key = QPushButton(self.tr("Copy public key"))
-        copy_key.setToolTip(
-            self.tr(
-                "For verification only - this alone is not enough for someone "
-                "to add you. Use Share Contact to actually let someone connect."
-            )
-        )
-        copy_key.clicked.connect(
-            lambda: self._copy(identity.public_key, self.tr("Public key copied."))
-        )
-        copy_row.addWidget(copy_key)
-
-        copy_fp = QPushButton(self.tr("Copy fingerprint"))
-        copy_fp.clicked.connect(
-            lambda: self._copy(identity.fingerprint, self.tr("Fingerprint copied."))
-        )
-        copy_row.addWidget(copy_fp)
-        layout.addLayout(copy_row)
 
         # --- Private ---
         private_header = QHBoxLayout()
@@ -1226,6 +1304,18 @@ class NewGroupDialog(QDialog):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
             self.member_list.addItem(item)
+        # Qt.ItemIsUserCheckable alone does NOT make a single click
+        # anywhere on the row toggle the box - by itself it only makes
+        # the indicator paint and become clickable in the few exact
+        # pixels of the glyph itself, and even there Qt does not
+        # auto-toggle on click without this handler (verified
+        # empirically: clicking directly on the checkbox glyph did
+        # nothing until this was added). Without this, the box exists
+        # and paints correctly but is inert - which reads exactly like
+        # "the checkmark doesn't appear" from a user's side, since
+        # clicking the row (the obvious thing to do) visibly does
+        # nothing at all.
+        self.member_list.itemClicked.connect(self._on_member_item_clicked)
         layout.addWidget(self.member_list, stretch=1)
 
         self.error_label = QLabel("")
@@ -1237,6 +1327,11 @@ class NewGroupDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _on_member_item_clicked(self, item: QListWidgetItem) -> None:
+        item.setCheckState(
+            Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+        )
 
     def _on_accept(self) -> None:
         name = self.name_input.text().strip()
@@ -1467,9 +1562,56 @@ class MainWindow(QMainWindow):
         self._start_network()
 
     # -- UI ---------------------------------------------------------------- #
+    def _build_menu_bar(self) -> None:
+        """
+        A VSCode-style top menu bar - real dropdown menus, using this
+        app's own action names (Contact/Group/etc, not a literal
+        File/Edit/View borrowed from a text editor). This is now the ONLY
+        way to reach Share/Keys/Settings/Add/Remove/New Group/Join Group -
+        the sidebar used to also have buttons for these, but once every
+        action had a menu-bar home, keeping both was pure duplication, so
+        the sidebar buttons were removed (see _build_sidebar) in favor of
+        this being the one place they live.
+
+        QMainWindow already owns exactly one QMenuBar (self.menuBar()
+        creates it on first call) - no manual QMenuBar()/setMenuBar()
+        needed. Native styling keeps each top-level entry to its
+        platform's own compact padding rather than anything set here.
+        """
+        menu_bar = self.menuBar()
+
+        contact_menu = menu_bar.addMenu(self.tr("Contact"))
+        contact_menu.addAction(self.tr("Add…"), self._on_add_contact)
+        contact_menu.addSeparator()
+        contact_menu.addAction(self.tr("Remove"), self._on_remove_contact)
+
+        group_menu = menu_bar.addMenu(self.tr("Group"))
+        group_menu.addAction(self.tr("New Group…"), self._on_new_group)
+        group_menu.addAction(self.tr("Join Group…"), self._on_join_group)
+
+        share_menu = menu_bar.addMenu(self.tr("Share"))
+        # Kept as self.share_action (not a local var) - _refresh_identity_display
+        # disables it until this identity is actually published/reachable,
+        # same rule the old sidebar Share button enforced.
+        self.share_action = share_menu.addAction(self.tr("Share Contact…"), self._on_share_contact)
+
+        keys_menu = menu_bar.addMenu(self.tr("Keys"))
+        keys_menu.addAction(self.tr("View Keys…"), self._on_identity)
+
+        settings_menu = menu_bar.addMenu(self.tr("Settings"))
+        settings_menu.addAction(self.tr("Preferences…"), self._on_settings)
+        settings_menu.addSeparator()
+        settings_menu.addAction(self.tr("Check Connection"), self._on_check_now)
+
+        help_menu = menu_bar.addMenu(self.tr("Help"))
+        about_text = i18n.fmt(self.tr("About %(name)s…"), name=version.version_string())
+        help_menu.addAction(about_text, self._on_about)
+
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
+
+        self._build_menu_bar()
 
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1531,58 +1673,71 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
-        # 290, not 240: three QPushButtons ("Share"/"Keys"/"Settings",
-        # already shortened to their minimum practical labels - see the
-        # button_row comment below) need ~274px on their own even at
-        # Qt's default per-button padding, before the panel's own left/
-        # right margins (12 + 6) are added - 240 clipped "Settings" to
-        # "etting" at the sidebar's documented minimum width. Verified
-        # empirically (QWidget.sizeHint() on the real button row), not
-        # just estimated, before picking this number.
-        panel.setMinimumWidth(290)
+        self._sidebar_panel = panel
+        # This is the EXPANDED width - wide enough for a contact row's
+        # name/count/queued-state text (e.g. "Alice  (12)  [2 queued]")
+        # and the monospace fingerprint line without wrapping awkwardly.
+        # Collapsed width is _sidebar_collapsed_width below (see
+        # _on_toggle_sidebar) - just enough for a 36px avatar icon plus
+        # list-item padding, no text at all.
+        self._sidebar_expanded_width = 290
+        # Measured empirically, not hand-calculated: QListWidget's own
+        # sizeHintForColumn(0) with only icon-only (no text) rows loaded -
+        # which already accounts for Fusion style's real frame width,
+        # item padding/margin, and the row's selection-ring border (see
+        # theme.py's QListWidget[collapsed="true"]::item:selected) - plus
+        # this panel's own 12+6 left/right margins. Two earlier smaller
+        # guesses (56px, then 74px) both clipped the avatar's right edge
+        # in a real screenshot before landing on this value.
+        self._sidebar_collapsed_width = 120
+        self._sidebar_collapsed = False
+        panel.setMinimumWidth(self._sidebar_expanded_width)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 6, 12)
         layout.setSpacing(8)
+
+        # Toggle sits above everything else and is the one element that
+        # stays visible in both collapsed and expanded states - closing
+        # the sidebar must never also hide the control that reopens it.
+        toggle_row = QHBoxLayout()
+        self.sidebar_toggle = QPushButton()
+        self.sidebar_toggle.setIcon(_chevron_icon(self.palette_colors.text, pointing_left=True))
+        self.sidebar_toggle.setFixedSize(28, 28)
+        self.sidebar_toggle.setToolTip(self.tr("Collapse sidebar"))
+        self.sidebar_toggle.setCursor(Qt.PointingHandCursor)
+        self.sidebar_toggle.clicked.connect(self._on_toggle_sidebar)
+        toggle_row.addWidget(self.sidebar_toggle)
+        toggle_row.addStretch(1)
+        layout.addLayout(toggle_row)
+
+        # Everything below is only shown expanded - collapsed, the sidebar
+        # is icons only (the toggle above, and contact_list's own icons -
+        # see _on_toggle_sidebar/_reload_contacts). Grouped into one
+        # container so showing/hiding the whole expanded view is a single
+        # setVisible() call rather than toggling each widget separately.
+        self._sidebar_expanded = QWidget()
+        expanded_layout = QVBoxLayout(self._sidebar_expanded)
+        expanded_layout.setContentsMargins(0, 0, 0, 0)
+        expanded_layout.setSpacing(8)
+        layout.addWidget(self._sidebar_expanded)
 
         title = QLabel(self.tr("You"))
         bold = QFont()
         bold.setBold(True)
         title.setFont(bold)
-        layout.addWidget(title)
+        expanded_layout.addWidget(title)
 
         # No raw onion address shown here - it is an internal transport
         # detail, not a normal user-facing identity field, and no mention
         # of Tor by name either - just a plain security/readiness state.
         # The fingerprint below is what a contact actually verifies you by.
         self.my_status_label = QLabel()
-        layout.addWidget(self.my_status_label)
+        expanded_layout.addWidget(self.my_status_label)
 
-        # Short labels (the full description lives in each button's
-        # tooltip) so all three comfortably fit the sidebar's width without
-        # clipping - "Share Contact...", "Keys...", "Settings..." routinely
-        # overflowed a narrow sidebar and got visually truncated.
-        button_row = QHBoxLayout()
-        self.share_button = QPushButton(self.tr("Share"))
-        self.share_button.setToolTip(
-            self.tr(
-                "Share Contact: QR code and copyable bundle a contact can scan or "
-                "paste to add you - never your onion address in the clear."
-            )
-        )
-        self.share_button.clicked.connect(self._on_share_contact)
-        button_row.addWidget(self.share_button)
-
-        identity_button = QPushButton(self.tr("Keys"))
-        identity_button.setToolTip(self.tr("Fingerprint, backup, and identity"))
-        identity_button.clicked.connect(self._on_identity)
-        button_row.addWidget(identity_button)
-
-        settings_button = QPushButton(self.tr("Settings"))
-        settings_button.setToolTip(self.tr("Language and who can reach you"))
-        settings_button.clicked.connect(self._on_settings)
-        button_row.addWidget(settings_button)
-        layout.addLayout(button_row)
-
+        # Share/Keys/Settings used to be buttons here - they now live only
+        # in the top menu bar (see _build_menu_bar), so this sidebar is
+        # purely status display plus the contact/group list, nothing
+        # actionable duplicated in two places.
         self.fingerprint_label = QLabel("")
         self.fingerprint_label.setStyleSheet(
             f"color: {self.palette_colors.text_muted}; font-family: monospace;"
@@ -1597,49 +1752,33 @@ class MainWindow(QMainWindow):
         self.fingerprint_label.setToolTip(
             self.tr("Your fingerprint. Read it to a contact so they can verify you.")
         )
-        layout.addWidget(self.fingerprint_label)
+        expanded_layout.addWidget(self.fingerprint_label)
 
         contacts_title = QLabel(self.tr("Contacts"))
         contacts_title.setFont(bold)
-        layout.addWidget(contacts_title)
+        expanded_layout.addWidget(contacts_title)
 
+        # contact_list itself is NOT inside _sidebar_expanded - it stays
+        # visible in both states, since collapsed mode still shows every
+        # contact/group, just as an icon-only column (see
+        # _on_toggle_sidebar/_reload_contacts) rather than disappearing
+        # entirely the way the buttons and labels above do.
         self.contact_list = QListWidget()
         self.contact_list.setIconSize(QSize(36, 36))
         self.contact_list.currentItemChanged.connect(self._on_contact_selected)
         self.contact_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.contact_list.customContextMenuRequested.connect(self._on_contact_menu)
+        # Collapsed mode narrows this list to just past its icon's width
+        # (see _sidebar_collapsed_width) - without this, Qt's default
+        # (unstyled - theme.py only styles the vertical scrollbar)
+        # horizontal scrollbar appeared at the bottom of the icon column,
+        # which read as a stray, out-of-place UI artifact rather than a
+        # real scrollbar for content that never actually needs horizontal
+        # scrolling in the first place (row text always wraps/elides, never
+        # scrolls sideways).
+        self.contact_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.contact_list.setProperty("collapsed", False)
         layout.addWidget(self.contact_list, stretch=1)
-
-        # Two rows, not one - four buttons ("Add"/"New Group"/"Join Group"/
-        # "Remove") in a single QHBoxLayout at the sidebar's default width
-        # (340px, 240px minimum - see the splitter setup) clipped the
-        # later buttons' text under several languages, most visibly
-        # "Join Group"/"New Group" together. Splitting into contact
-        # actions (Add/Remove) and group actions (New/Join) keeps each
-        # row to two buttons, which fits comfortably down to the sidebar's
-        # actual minimum width instead of only at a wide window size.
-        contact_row = QHBoxLayout()
-        add_button = QPushButton(self.tr("Add"))
-        add_button.clicked.connect(self._on_add_contact)
-        contact_row.addWidget(add_button)
-
-        remove_button = QPushButton(self.tr("Remove"))
-        remove_button.clicked.connect(self._on_remove_contact)
-        contact_row.addWidget(remove_button)
-        layout.addLayout(contact_row)
-
-        group_row = QHBoxLayout()
-        new_group_button = QPushButton(self.tr("New Group"))
-        new_group_button.clicked.connect(self._on_new_group)
-        group_row.addWidget(new_group_button)
-
-        join_group_button = QPushButton(self.tr("Join Group"))
-        join_group_button.setToolTip(
-            self.tr("Paste an invite someone sent you to join their group.")
-        )
-        join_group_button.clicked.connect(self._on_join_group)
-        group_row.addWidget(join_group_button)
-        layout.addLayout(group_row)
 
         return panel
 
@@ -1674,6 +1813,8 @@ class MainWindow(QMainWindow):
         # is turned off in favor of handling every click ourselves.
         self.thread_view.setOpenLinks(False)
         self.thread_view.anchorClicked.connect(self._on_thread_link_clicked)
+        self.thread_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.thread_view.customContextMenuRequested.connect(self._on_thread_context_menu)
         layout.addWidget(self.thread_view, stretch=3)
         # message id -> Message, refreshed every _render_conversation() call,
         # so _on_thread_link_clicked can resolve an "attach:<id>" href back
@@ -1712,12 +1853,21 @@ class MainWindow(QMainWindow):
         # Icon-only, like the round send button - the tooltip carries the
         # actual description rather than a wide "Attach..." label. Not
         # wrapped in self.tr(): same reason as the lock emoji in
-        # _refresh_identity_display - pyside6-lupdate corrupts non-BMP
-        # (astral-plane) characters like this paperclip when extracting
-        # from Python source (U+1F4CE gets truncated to U+F4CE, a private-
-        # use codepoint, in the generated .ts), and a glyph needs no
-        # per-language translation anyway.
-        self.attach_button = QPushButton("\U0001F4CE")
+        # A real PNG (icons/ui/attach.png), not the U+1F4CE paperclip
+        # emoji this used to be - the emoji depends on which font/emoji
+        # set happens to be installed to render as an actual paperclip at
+        # all (the same font-fallback unreliability already found and
+        # fixed for the copy-icon and sidebar-collapse chevron elsewhere
+        # in this file - see _copy_icon's docstring), and separately,
+        # pyside6-lupdate corrupts non-BMP (astral-plane) characters like
+        # it when extracting from Python source (U+1F4CE gets truncated
+        # to U+F4CE, a private-use codepoint, in the generated .ts) -
+        # neither problem exists for a real image asset.
+        self.attach_button = QPushButton()
+        attach_icon = ui_icon("attach.png", None, 20)
+        if attach_icon is not None:
+            self.attach_button.setIcon(attach_icon)
+            self.attach_button.setIconSize(QSize(20, 20))
         self.attach_button.setObjectName("attachButton")
         self.attach_button.setCursor(Qt.PointingHandCursor)
         self.attach_button.setToolTip(
@@ -1834,6 +1984,62 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    # -- Sidebar collapse ---------------------------------------------------- #
+    def _on_toggle_sidebar(self) -> None:
+        """
+        Collapses the sidebar to a narrow icon-only strip pinned to the
+        left, or expands it back to the normal view - everything it
+        already showed (status, fingerprint) reappears exactly as it
+        was, nothing is moved or removed permanently. The toggle button
+        itself (self.sidebar_toggle) is the one thing that stays visible
+        in both states, so collapsing never hides the only way back.
+        """
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        collapsed = self._sidebar_collapsed
+
+        self._sidebar_expanded.setVisible(not collapsed)
+
+        # Right-pointing chevron = "expand me"; left-pointing = "collapse
+        # me" - the arrow always shows the direction the *action* moves
+        # the sidebar's edge, matching the convention in VSCode and most
+        # other docked-panel UIs, not the direction the panel currently
+        # points.
+        self.sidebar_toggle.setIcon(
+            _chevron_icon(self.palette_colors.text, pointing_left=not collapsed)
+        )
+        self.sidebar_toggle.setToolTip(
+            self.tr("Expand sidebar") if collapsed else self.tr("Collapse sidebar")
+        )
+
+        width = self._sidebar_collapsed_width if collapsed else self._sidebar_expanded_width
+        self._sidebar_panel.setMinimumWidth(width)
+        self._sidebar_panel.setMaximumWidth(width if collapsed else 16777215)
+
+        splitter = self._sidebar_panel.parentWidget()
+        if isinstance(splitter, QSplitter):
+            total = sum(splitter.sizes()) or (width + 760)
+            splitter.setSizes([width, max(total - width, 200)])
+
+        # Icon-only rows have no text for the normal filled-rectangle
+        # selection highlight (theme.py's QListWidget::item:selected) to
+        # sit next to - on a round avatar with nothing beside it, that
+        # same highlight instead reads as a jarring purple square stamped
+        # behind a circle. The "collapsed" dynamic property switches to a
+        # slimmer ring-style highlight instead (see theme.py's
+        # QListWidget[collapsed="true"]::item:selected rule) -
+        # setProperty() alone does not repaint anything on its own; the
+        # unpolish/polish pair forces Qt to actually re-evaluate which
+        # stylesheet rules apply to this widget right now.
+        self.contact_list.setProperty("collapsed", collapsed)
+        self.contact_list.style().unpolish(self.contact_list)
+        self.contact_list.style().polish(self.contact_list)
+
+        # Collapsed rows show only the avatar icon (no name/count text) -
+        # re-run the same render path used for a normal reload rather than
+        # hand-editing each QListWidgetItem's text, so there is exactly
+        # one place that ever decides what a row's label says.
+        self._reload_contacts(select_id=self._active_contact_id or self._active_group_id)
+
     # -- Contacts ----------------------------------------------------------- #
     def _reload_contacts(self, select_id: str | None = None) -> None:
         self.contact_list.blockSignals(True)
@@ -1841,9 +2047,10 @@ class MainWindow(QMainWindow):
 
         # One combined, recency-sorted list of contacts and groups, like an
         # ordinary messenger's conversation list - built as (sort_key, kind,
-        # id, label, tooltip) tuples first so the two kinds can be merged
-        # and sorted together rather than shown as two separate blocks.
-        rows: list[tuple[str, str, str, str, str]] = []
+        # id, label, tooltip, avatar_name, verified) tuples first so the
+        # two kinds can be merged and sorted together rather than shown as
+        # two separate blocks.
+        rows: list[tuple[str, str, str, str, str, str, bool]] = []
 
         for contact in self.vault.sorted_contacts():
             if contact.status == vault_mod.STATUS_BLOCKED:
@@ -1862,8 +2069,15 @@ class MainWindow(QMainWindow):
                 label = self.tr("[request] %(name)s") % {"name": contact.name}
                 tooltip = self.tr("Wants to message you. Select to accept or block.")
             else:
-                marker = "\u2713 " if contact.verified else ""
                 # Presence: filled dot online, hollow offline, nothing if unknown.
+                # The verified checkmark itself is no longer text here - it
+                # is composited onto the avatar icon's corner instead (see
+                # _avatar_icon's `verified` argument below), since a real
+                # icon reads more clearly than a Unicode checkmark whose
+                # actual on-screen appearance depends on which fonts
+                # happen to be installed (verified empirically to be
+                # unreliable - see _copy_icon's docstring for the same
+                # finding elsewhere in this file).
                 online = self.delivery.is_online(contact.id) if self.delivery else None
                 presence = "" if online is None else ("\u25cf " if online else "\u25cb ")
                 queued = sum(
@@ -1873,9 +2087,12 @@ class MainWindow(QMainWindow):
                 suffix = self.tr("  (%(count)s)") % {"count": count} if count else ""
                 if queued:
                     suffix += self.tr("  [%(queued)s queued]") % {"queued": queued}
-                label = f"{presence}{marker}{contact.name}{suffix}"
+                label = f"{presence}{contact.name}{suffix}"
 
-            rows.append((contact.last_activity, _KIND_CONTACT, contact.id, label, tooltip, contact.name))
+            rows.append((
+                contact.last_activity, _KIND_CONTACT, contact.id, label, tooltip,
+                contact.name, contact.verified,
+            ))
 
         for group in self.vault.groups:
             messages = self.vault.group_messages(group)
@@ -1896,17 +2113,25 @@ class MainWindow(QMainWindow):
             }
             rows.append((
                 self.vault.group_last_activity(group), _KIND_GROUP, group.id, label,
-                self.tr("Group of %(members)s") % {"members": member_count}, group.name,
+                self.tr("Group of %(members)s") % {"members": member_count}, group.name, False,
             ))
 
         rows.sort(key=lambda r: r[0], reverse=True)
 
-        for _sort_key, kind, item_id, label, tooltip, avatar_name in rows:
-            item = QListWidgetItem(_avatar_icon(avatar_name), label)
+        collapsed = getattr(self, "_sidebar_collapsed", False)
+        for _sort_key, kind, item_id, label, tooltip, avatar_name, verified in rows:
+            # Collapsed: icon only, no text - the row's name/count/queued
+            # label moves entirely into the tooltip so it's still
+            # discoverable on hover, matching how a collapsed VSCode
+            # activity-bar icon still shows its name as a tooltip rather
+            # than losing it outright.
+            item = QListWidgetItem(
+                _avatar_icon(avatar_name, kind=kind, verified=verified),
+                "" if collapsed else label,
+            )
             item.setData(Qt.UserRole, item_id)
             item.setData(_ITEM_KIND_ROLE, kind)
-            if tooltip:
-                item.setToolTip(tooltip)
+            item.setToolTip(tooltip or (label if collapsed else ""))
             self.contact_list.addItem(item)
 
         self.contact_list.blockSignals(False)
@@ -2326,7 +2551,7 @@ class MainWindow(QMainWindow):
         text = self.tr("Secure - ready") if published else self.tr("Secure - starting")
         status = f"\U0001f512 {text}"
         self.my_status_label.setText(status)
-        self.share_button.setEnabled(published)
+        self.share_action.setEnabled(published)
         self.fingerprint_label.setText(
             i18n.fmt(self.tr("FP: %(fp)s"), fp=identity.fingerprint)
         )
@@ -2492,7 +2717,7 @@ class MainWindow(QMainWindow):
 
         self.request_bar.setVisible(False)
 
-        verified_mark = self.tr(" \u2713 verified") if contact.verified else ""
+        verified_mark = f" {_verified_badge_html()}" if contact.verified else ""
         online = self.delivery.is_online(contact.id) if self.delivery else None
         if online is True:
             presence_text = self.tr(" \u2014 online")
@@ -2503,7 +2728,7 @@ class MainWindow(QMainWindow):
         self.conversation_header.setText(
             f"{escape_html(contact.name)}{verified_mark}{presence_text}"
         )
-        self.conversation_avatar.setPixmap(_avatar_pixmap(contact.name, 34))
+        self.conversation_avatar.setPixmap(_avatar_pixmap(contact.name, 34, kind=_KIND_CONTACT))
         self.conversation_avatar.setVisible(True)
         self._set_composer_enabled(self.tor.service is not None)
 
@@ -2571,7 +2796,7 @@ class MainWindow(QMainWindow):
                 self.tr("◈ %(name)s"), name=escape_html(group.name),
             ) + f"  ·  {joined_members}"
         )
-        self.conversation_avatar.setPixmap(_avatar_pixmap(group.name, 34))
+        self.conversation_avatar.setPixmap(_avatar_pixmap(group.name, 34, kind=_KIND_GROUP))
         self.conversation_avatar.setVisible(True)
         self._set_composer_enabled(self.tor.service is not None and bool(group.member_contact_ids))
 
@@ -2661,18 +2886,28 @@ class MainWindow(QMainWindow):
 
     def _on_thread_link_clicked(self, url) -> None:
         """
-        Handles a click on a link inside a message bubble - either
-        "attach:<id>" (Save As..., see _attachment_html) or "delmsg:<id>"
-        (Delete, see render_bubble) - the only two kinds of link the thread
-        view ever contains (setOpenLinks(False) above stops Qt from doing
-        anything with either on its own).
+        Handles a left-click on a link inside a message bubble. Three
+        kinds: "attach:<id>" (Save As..., see _attachment_html), "open:
+        <id>" (Open - only shown once a saved copy still exists on disk,
+        see _attachment_html/Message.saved_path), and "msg:<id>", the
+        invisible whole-bubble anchor render_bubble wraps every message
+        in purely so _on_thread_context_menu can resolve a right-click
+        position back to a Message; a left-click on it does nothing
+        (Delete now lives only in that right-click menu, not as an
+        always-visible link - see _on_thread_context_menu).
+        setOpenLinks(False) above stops Qt from doing anything with any
+        of these on its own.
         """
         href = url.toString()
-        if href.startswith("delmsg:"):
-            message_id = href[len("delmsg:"):]
+        if href.startswith("open:"):
+            message_id = href[len("open:"):]
             msg = self._rendered_messages.get(message_id)
-            if msg is not None:
-                self._on_delete_message(msg)
+            saved_path = getattr(msg, "saved_path", "") if msg is not None else ""
+            # Re-checked here, not just trusted from the link having been
+            # shown at all - the file could have been moved/deleted in
+            # the time between rendering the bubble and this click.
+            if saved_path and os.path.isfile(saved_path):
+                QDesktopServices.openUrl(QUrl.fromLocalFile(saved_path))
             return
         if not href.startswith("attach:"):
             return
@@ -2704,6 +2939,20 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Remembered so future visits to this same message can offer
+        # "Open" directly (see _on_thread_context_menu) instead of asking
+        # "Save As..." every single time - the recipient already chose a
+        # location once; there is no need to make them repeat that choice
+        # just to look at a file they already have on disk. Not affected
+        # by "delete for everyone" - see Message.saved_path's docstring on
+        # why a saved copy is the recipient's own, independent of this
+        # vault's in-app copy. msg.contact_id is the right lookup key even
+        # for a group message - add_message() always stores a Message
+        # under its own contact_id's list regardless of group_id (see
+        # vault.Message's sender_contact_id docstring).
+        self.vault.mark_attachment_saved(msg.contact_id, msg.id, target_path)
+        msg.saved_path = target_path
+
         # Never opened automatically - this is a deliberate second action
         # by the user, after they already chose to save it (see
         # _attachment_html's docstring on why nothing about an attachment
@@ -2720,6 +2969,70 @@ class MainWindow(QMainWindow):
         )
         if open_now == QMessageBox.Yes:
             QDesktopServices.openUrl(QUrl.fromLocalFile(target_path))
+
+    def _on_thread_context_menu(self, position) -> None:
+        """
+        Right-click menu for a single message bubble - replaces the old
+        always-visible inline "Delete" link (see render_bubble) with an
+        on-demand menu, matching how _on_contact_menu already offers
+        actions for a sidebar row instead of showing them all inline.
+
+        anchorAt(position) resolves which bubble was clicked via the
+        invisible "msg:<id>" anchor render_bubble wraps every row in -
+        the same technique already used for the real "attach:<id>" link,
+        just covering the whole bubble instead of one word of text, so a
+        right-click anywhere on a message (not only exactly on a link)
+        still finds the right Message.
+        """
+        href = self.thread_view.anchorAt(position)
+        if not href.startswith("msg:"):
+            return
+        message_id = href[len("msg:"):]
+        msg = self._rendered_messages.get(message_id)
+        if msg is None:
+            return
+
+        menu = QMenu(self)
+        copy_action = None
+        open_action = None
+        save_action = None
+        delete_action = None
+
+        if not getattr(msg, "deleted", False):
+            if getattr(msg, "attachment_filename", ""):
+                # "Open" only offered once a saved copy actually exists at
+                # a path that's still real right now - checked here, at
+                # menu-build time, not trusted from the stored path alone
+                # (the user could have moved/renamed/deleted it since
+                # saving, entirely outside this app's knowledge). "Save
+                # As..." stays available even when "Open" is - saving a
+                # second copy elsewhere is still a normal thing to want.
+                saved_path = getattr(msg, "saved_path", "")
+                if saved_path and os.path.isfile(saved_path):
+                    open_action = menu.addAction(self.tr("Open"))
+                save_action = menu.addAction(self.tr("Save As…"))
+            else:
+                copy_action = menu.addAction(self.tr("Copy text"))
+
+        if msg.direction == "out" and not getattr(msg, "deleted", False) and getattr(msg, "client_msg_id", ""):
+            if not menu.isEmpty():
+                menu.addSeparator()
+            delete_action = menu.addAction(self.tr("Delete"))
+
+        if menu.isEmpty():
+            return
+
+        chosen = menu.exec(self.thread_view.viewport().mapToGlobal(position))
+        if chosen is None:
+            return
+        if chosen == copy_action:
+            QApplication.clipboard().setText(msg.body)
+        elif chosen == open_action:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(msg.saved_path))
+        elif chosen == save_action:
+            self._on_thread_link_clicked(QUrl(f"attach:{msg.id}"))
+        elif chosen == delete_action:
+            self._on_delete_message(msg)
 
     def _on_delete_message(self, msg: vault_mod.Message) -> None:
         """
@@ -3007,10 +3320,30 @@ class MainWindow(QMainWindow):
             else ""
         )
 
+        # Computed once, reused for both the shared body below and every
+        # per-member onboarding body further down - computed once rather
+        # than per-call so every member sees the SAME filename for the
+        # same attachment, exactly as they would have all seen the same
+        # real filename. An IMAGE gets a random, unguessable name (see
+        # _random_image_filename's docstring), generated HERE rather than
+        # trusted to already be random in file_path - this method is
+        # called directly (see _on_send_file), and an implicit "the
+        # caller already randomized it" contract is exactly the kind of
+        # assumption that silently breaks the moment a new caller doesn't
+        # know about it (verified concretely: this exact bug was caught
+        # by a direct-call test - see test_delete.py). Any other file
+        # type keeps its own real name (sanitized of path components by
+        # envelope.py) - a recipient usually needs to actually know what
+        # a document/archive/etc. is called, unlike a photo.
+        wire_filename = (
+            (_random_image_filename(file_mime) if file_mime.startswith("image/") else os.path.basename(file_path))
+            if is_file else ""
+        )
+
         def build_body(invcode: str) -> str:
             if is_file:
                 return envelope.encode_file(
-                    os.path.basename(file_path), file_mime, file_data,
+                    wire_filename, file_mime, file_data,
                     gid=group.id, gname=group.name, mid=client_msg_id, invcode=invcode,
                 )
             return envelope.encode_text(
@@ -3049,14 +3382,27 @@ class MainWindow(QMainWindow):
             except (ValueError, vault_mod.VaultLocked):
                 continue  # not the owner, or identity not ready - falls back to the shared body
             personal_code = invite_mod.parse_invite(personal_invite).code
+            # `invite` carries the FULL signed invite text (not just its
+            # bare code, unlike invcode) - this is what lets the
+            # recipient's own app call join_group_from_invite()
+            # automatically the moment this envelope arrives, closing the
+            # gap where a directly-added member's app previously had no
+            # way to learn the group existed at all short of the owner
+            # separately doing "Create invite..." and the member manually
+            # pasting it via "Join Group...". invcode is still attached
+            # too - unchanged - since it's what the OWNER's side needs
+            # back (via redeem_group_invite_locally) once the member's
+            # app starts sending; the two fields serve the two different
+            # directions of this same handshake.
             per_member_bodies[member_id] = (
                 envelope.encode_file(
-                    os.path.basename(file_path), file_mime, file_data,
-                    gid=group.id, gname=group.name, mid=client_msg_id, invcode=personal_code,
+                    wire_filename, file_mime, file_data,
+                    gid=group.id, gname=group.name, mid=client_msg_id,
+                    invcode=personal_code, invite=personal_invite,
                 ) if is_file else
                 envelope.encode_text(
                     text_body, gid=group.id, gname=group.name,
-                    mid=client_msg_id, invcode=personal_code,
+                    mid=client_msg_id, invcode=personal_code, invite=personal_invite,
                 )
             )
             per_member_invcodes[member_id] = personal_code
@@ -3217,90 +3563,63 @@ class MainWindow(QMainWindow):
             return
 
         if mime.startswith("image/"):
-            original_mime = mime
-            data, mime = self._resolve_image_send_choice(data, mime)
-            if data is None:
-                return  # user cancelled
-            if mime != original_mime:
-                # Recompressed to JPEG - rename so the extension the
-                # recipient sees actually matches the bytes being sent,
-                # rather than e.g. still claiming ".png" for JPEG content.
-                base, _ext = os.path.splitext(os.path.basename(path))
-                path = f"{base}.jpg"
+            # Always re-encoded, no dialog, no "send original" choice -
+            # see _recompress_image_bytes's own docstring for exactly
+            # what this strips (EXIF/GPS/thumbnails/comments, plus any
+            # non-image bytes hidden in a file merely disguised as one).
+            # Previously this was a per-send prompt defaulting to
+            # compressed but allowing "Send Original" - removed entirely
+            # so there is no way, deliberate or accidental, to leak the
+            # original file's metadata to a recipient.
+            recompressed = _recompress_image_bytes(data)
+            if recompressed is None:
+                QMessageBox.warning(
+                    self,
+                    self.tr("Could not read image"),
+                    self.tr(
+                        "This file could not be decoded as an image, so it cannot be "
+                        "sent safely. It may not actually be an image, or may be "
+                        "corrupted."
+                    ),
+                )
+                return
+            # Recompressed to JPEG. `path` itself is left as the original
+            # filesystem path - it is no longer used to derive the
+            # attachment's wire filename at all for an image (the send
+            # helpers below - _start_group_send/_start_contact_file_send/
+            # _start_contact_chunked_send - each generate their own fresh
+            # _random_image_filename() whenever file_mime is an image, so
+            # there is exactly one place per send path that decides the
+            # wire filename, rather than this method pre-computing one
+            # that a callee would then have to trust was already random).
+            data, mime = recompressed, "image/jpeg"
 
         if target_group is not None:
             self._start_group_send(target_group, file_path=path, file_data=data, file_mime=mime)
         elif target_contact is not None:
             self._start_contact_file_send(target_contact, path, data, mime)
 
-    def _resolve_image_send_choice(
-        self, data: bytes, mime: str
-    ) -> tuple[bytes | None, str]:
-        """
-        Ask the user whether to send an image attachment as-is or
-        re-encoded (see _recompress_image_bytes) before it goes out.
-
-        Framed for the user as a security choice, not a quality/size one:
-        a file that is merely disguised as an image (or an image file with
-        something extra appended or embedded in it) is a real way to smuggle
-        an unwanted payload to a contact, and re-encoding strips all of that
-        - at the cost of re-compressing the picture itself and stripping its
-        metadata (including anything like embedded location data, which some
-        people want gone anyway). Sending the original stays available for
-        when fidelity matters and the file is trusted (e.g. a photo the user
-        just took themselves).
-
-        Returns (None, "") if the user cancelled the send entirely - the
-        caller must treat that as "do not send anything". Returns the
-        original (data, mime) unchanged if the user chose "Send Original",
-        or (recompressed bytes, "image/jpeg") if they chose "Send
-        Compressed".
-        """
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Question)
-        box.setWindowTitle(self.tr("Send image"))
-        box.setText(
-            self.tr(
-                "Send this image as-is, or re-encoded first?\n\n"
-                "Re-encoding fully decodes the image and rebuilds it from "
-                "scratch, discarding anything hidden in the original file "
-                "(and its metadata, such as location data) - recommended "
-                "unless you need the exact original file, e.g. for quality "
-                "or provenance."
-            )
-        )
-        compressed_button = box.addButton(self.tr("Send Compressed"), QMessageBox.AcceptRole)
-        original_button = box.addButton(self.tr("Send Original"), QMessageBox.DestructiveRole)
-        box.addButton(QMessageBox.Cancel)
-        box.setDefaultButton(compressed_button)
-        box.exec()
-        clicked = box.clickedButton()
-
-        if clicked is original_button:
-            return data, mime
-        if clicked is not compressed_button:
-            return None, ""  # Cancel, or the dialog was dismissed
-
-        recompressed = _recompress_image_bytes(data)
-        if recompressed is None:
-            QMessageBox.warning(
-                self,
-                self.tr("Could not read image"),
-                self.tr(
-                    "This file could not be decoded as an image, so it cannot be "
-                    "safely re-encoded. It may not actually be an image, or may be "
-                    "corrupted - sending it as-is is not recommended."
-                ),
-            )
-            return None, ""
-        return recompressed, "image/jpeg"
-
     def _start_contact_file_send(
         self, contact: vault_mod.Contact, file_path: str, file_data: bytes, file_mime: str,
     ) -> None:
         client_msg_id = str(uuid.uuid4())
+        # An image gets a random, unguessable name (see
+        # _random_image_filename's docstring) - generated HERE, not
+        # trusted to already be random in file_path, so this holds no
+        # matter what the caller passed in (this method is called
+        # directly from more than one place - see _on_send_file - and an
+        # implicit "the caller already randomized it" contract is exactly
+        # the kind of assumption that silently breaks the moment a new
+        # caller doesn't know about it). Any other file type keeps its
+        # own real name (still sanitized of any path components by
+        # envelope.py) - a recipient usually needs to know what a
+        # document/archive/etc. actually is, unlike a photo.
+        wire_filename = (
+            _random_image_filename(file_mime) if file_mime.startswith("image/")
+            else os.path.basename(file_path)
+        )
         wire_body = envelope.encode_file(
-            os.path.basename(file_path), file_mime, file_data, mid=client_msg_id,
+            wire_filename, file_mime, file_data, mid=client_msg_id,
         )
         sent = envelope.decode(wire_body)  # sanitized filename/mime, matches what is actually sent
 
@@ -3385,9 +3704,22 @@ class MainWindow(QMainWindow):
         # Message/FileTransfer alongside the first.
         transfer_id = str(uuid.uuid4())
 
+        # An image gets a random, unguessable name (see
+        # _random_image_filename's docstring) - same rule the small-file
+        # send path (_start_contact_file_send/_start_group_send) applies.
+        # Any other file type keeps its own real name. Chunked sends
+        # never recompress (would need loading the whole large file into
+        # memory, defeating the point of chunking it in the first place -
+        # see _on_send_file's own comment on this), so an image sent this
+        # way still carries its original bytes/metadata; the filename
+        # itself is the one piece of this still worth scrubbing here.
+        wire_filename = (
+            _random_image_filename(mime) if mime.startswith("image/")
+            else os.path.basename(file_path)
+        )
         try:
             start_wire = envelope.encode_file_start(
-                transfer_id, os.path.basename(file_path), mime, total_size, chunk_count,
+                transfer_id, wire_filename, mime, total_size, chunk_count,
                 mid=client_msg_id,
             )
         except envelope.EnvelopeError as exc:
@@ -3839,7 +4171,39 @@ class MainWindow(QMainWindow):
         """
         group = self.vault.get_group(env.gid)
         if group is None:
-            return None
+            # No local Group for this gid yet - but if this envelope
+            # carries a full signed invite (env.invite, only ever
+            # attached by the OWNER's side onboarding a newly-added
+            # member - see _start_group_send), redeem it automatically
+            # here, exactly as if the user had pasted it into "Join
+            # Group..." themselves (see _on_join_group). This is what
+            # actually closes the loop GUIDE.md already promises
+            # ("Veilwire automatically sends each of them a one-time
+            # invite behind the scenes so their own app learns the group
+            # exists") - previously the invite code WAS sent, but nothing
+            # on the receiving side ever consumed it, so a directly-added
+            # member's app silently dropped every group message forever
+            # unless they separately went through the fully manual
+            # invite-text copy/paste flow.
+            #
+            # join_group_from_invite() itself still enforces every real
+            # trust boundary before creating anything (see its own
+            # docstring): the invite's signature must verify, it must not
+            # be expired, and the signed owner identity must already be
+            # one of THIS vault's own accepted contacts - a forged or
+            # tampered invite, or one from someone not yet trusted, is
+            # rejected the same way a manually-pasted one would be. This
+            # is purely automating the paste step for the one case where
+            # the invite arrived attached to a message already proven to
+            # come from an accepted contact (the Box decryption that got
+            # us this far already establishes that), not loosening who
+            # gets trusted.
+            if not env.invite:
+                return None
+            try:
+                group = self.vault.join_group_from_invite(env.invite)
+            except (invite_mod.GroupInviteError, ValueError, vault_mod.VaultLocked):
+                return None
 
         is_owner = group.owner_contact_id == ""
         already_member = sender.id in group.member_contact_ids
@@ -4060,52 +4424,110 @@ _AVATAR_COLORS = (
 )
 
 
-def _avatar_pixmap(name: str, size: int = 36) -> QPixmap:
+def _avatar_pixmap(name: str, size: int = 36, kind: str = _KIND_CONTACT, verified: bool = False) -> QPixmap:
     """
-    A round, coloured avatar bearing the name's first letter - decorative
-    only, generated on the fly from text already in the vault (a contact's
-    or group's own display name), never uploaded, stored as an image, or
-    exchanged with anyone. Used as the QListWidgetItem icon in the sidebar
-    (native icon+text items keep the existing QListWidget::item:selected
-    styling "for free" - no custom item widget/selection-repaint logic
-    needed) and in the conversation header.
+    A round avatar showing a generic person/group glyph (icons/ui/
+    person.png or icons/ui/group.png) - transparent inside, with just a
+    coloured stroke/outline circle, not a filled background. The outline
+    colour is still derived from the contact's or group's own display
+    name (never uploaded, stored as an image, or exchanged with anyone),
+    so different contacts/groups still get a consistent, distinguishable
+    colour even though the glyph itself is the same for everyone of that
+    kind (a deliberate simplification over the previous per-name-letter
+    avatar - see the app's own "recognize people by consistent colour"
+    design note below on _AVATAR_COLORS, which still applies to the
+    outline). Used as the QListWidgetItem icon in the sidebar (native
+    icon+text items keep the existing QListWidget::item:selected styling
+    "for free" - no custom item widget/selection-repaint logic needed)
+    and in the conversation header.
+
+    `verified`, when True, composites the verified badge
+    (icons/ui/verified.png) onto the avatar's bottom-right corner - the
+    sidebar's QListWidgetItem text has no rich-text/inline-image support
+    (unlike the conversation header, a QLabel, which instead gets an
+    inline <img> - see _verified_badge_html()), so this is that surface's
+    only way to show the badge at all.
     """
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
 
-    letter = (name.strip()[:1] or "?").upper()
     digest = hashlib.sha256((name or "?").encode("utf-8")).digest()
     color = _AVATAR_COLORS[digest[0] % len(_AVATAR_COLORS)]
 
+    # Stroke only, no fill - the circle itself stays transparent (shows
+    # whatever's behind it) rather than a solid coloured disc. Line width
+    # scales gently with size so a small collapsed-sidebar icon doesn't
+    # get a disproportionately thick ring.
+    stroke_width = max(1, round(size / 18))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor(color))
-    painter.drawEllipse(0, 0, size, size)
-
-    font = QFont()
-    font.setPixelSize(max(10, int(size * 0.44)))
-    font.setBold(True)
-    painter.setFont(font)
-    painter.setPen(QColor("#ffffff"))
-    painter.drawText(pixmap.rect(), Qt.AlignCenter, letter)
+    pen = painter.pen()
+    pen.setColor(QColor(color))
+    pen.setWidth(stroke_width)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    inset = stroke_width // 2
+    painter.drawEllipse(inset, inset, size - 2 * inset - 1, size - 2 * inset - 1)
     painter.end()
+
+    # Both recolored to match this avatar's own outline colour (not
+    # white/native-toned, now that the circle behind them is transparent
+    # rather than a solid fill they needed to contrast against) so the
+    # glyph and its ring read as one consistent coloured mark. group.png
+    # is naturally a dark, multi-tone illustration - on a transparent
+    # background (no more solid colour disc behind it) its own dark tones
+    # were nearly invisible against the app's own dark theme; flattening
+    # it to one colour like person.png fixes that the same way.
+    glyph_file = "group.png" if kind == _KIND_GROUP else "person.png"
+    glyph_color = color
+    glyph_size = max(10, int(size * 0.6))
+    glyph_icon = ui_icon(glyph_file, glyph_color, glyph_size)
+    if glyph_icon is not None:
+        glyph_pixmap = glyph_icon.pixmap(glyph_size, glyph_size)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        offset = (size - glyph_size) // 2
+        painter.drawPixmap(offset, offset, glyph_pixmap)
+        painter.end()
+
+    if verified:
+        badge_size = max(10, int(size * 0.42))
+        # verified.png is already the intended blue - loaded unrecolored
+        # (color=None), not flattened to a hardcoded hex, so it always
+        # matches the actual icon file rather than a second, possibly
+        # drifting colour value maintained here.
+        badge_icon = ui_icon("verified.png", None, badge_size)
+        if badge_icon is not None:
+            badge_pixmap = badge_icon.pixmap(badge_size, badge_size)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            # Bottom-right corner, matching the badge placement convention
+            # most messaging apps use - a small white ring behind it so
+            # the badge stays legible over the avatar's own colour and
+            # over whatever glyph is directly behind it.
+            bx, by = size - badge_size, size - badge_size
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(bx - 1, by - 1, badge_size + 2, badge_size + 2)
+            painter.drawPixmap(bx, by, badge_pixmap)
+            painter.end()
 
     return pixmap
 
 
-_avatar_icon_cache: dict[str, QIcon] = {}
+_avatar_icon_cache: dict[tuple[str, str, bool], QIcon] = {}
 
 
-def _avatar_icon(name: str) -> QIcon:
+def _avatar_icon(name: str, kind: str = _KIND_CONTACT, verified: bool = False) -> QIcon:
     """Cached QIcon wrapper around _avatar_pixmap - the sidebar rebuilds
     every row on every reload (a new message, a presence change, ...), so
     this avoids repainting the same handful of contacts'/groups' avatars
     from scratch dozens of times a session."""
-    icon = _avatar_icon_cache.get(name)
+    cache_key = (name, kind, verified)
+    icon = _avatar_icon_cache.get(cache_key)
     if icon is None:
-        icon = QIcon(_avatar_pixmap(name))
-        _avatar_icon_cache[name] = icon
+        icon = QIcon(_avatar_pixmap(name, kind=kind, verified=verified))
+        _avatar_icon_cache[cache_key] = icon
     return icon
 
 
@@ -4116,6 +4538,34 @@ def _format_file_size(num_bytes: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+def _random_image_filename(mime: str) -> str:
+    """
+    An unguessable, unique random filename for an outgoing IMAGE
+    attachment - e.g. "a1b2c3d4e5f6a7b8.jpg" - never the sender's real
+    filename.
+
+    A photo's original filename routinely carries information that has
+    nothing to do with the picture's actual content - a phone's default
+    naming pattern, an embedded date, sometimes a person's name (e.g. a
+    screenshot named after the window it captured) - none of which the
+    sender necessarily means to share just by sending the picture. Random
+    rather than a predictable counter (this app previously used
+    "file"/"file2"/"file3", incrementing by one each time): a counted
+    sequence is guessable/correlatable across a conversation (a recipient
+    - or anyone who later sees several such names - can tell how many
+    images were sent in total, and in what order, purely from the names
+    themselves, and two different peoples' generic names could even
+    collide if compared) in a way a long random token is not. Generated
+    with `secrets.token_hex` (a CSPRNG, the same quality of randomness
+    group_invite.py's own invite codes already use - see
+    new_invite_code()), not any counter or timestamp - nothing about the
+    resulting name is derived from or correlated with anything else this
+    app sends.
+    """
+    ext = mimetypes.guess_extension(mime) or ".jpg"
+    return f"{secrets.token_hex(16)}{ext}"
 
 
 def _recompress_image_bytes(data: bytes) -> bytes | None:
@@ -4206,11 +4656,34 @@ def _attachment_html(msg, p) -> str:
         f"style='color:{p.accent};text-decoration:none;'>{save_as_text}</a>"
     )
 
+    # "Open" only shown once a saved copy actually exists at a path
+    # that's still real right now - checked here, at render time, not
+    # trusted from the stored path alone (the user could have moved/
+    # renamed/deleted it since saving - see Message.saved_path's
+    # docstring). Shown alongside "Save As...", not instead of it - saving
+    # a second copy elsewhere is still a normal thing to want even after
+    # already saving once.
+    open_link = ""
+    saved_path = getattr(msg, "saved_path", "")
+    if saved_path and os.path.isfile(saved_path):
+        open_text = i18n.tr("Open")
+        open_link = (
+            f"<a href='open:{escape_html(msg.id)}' "
+            f"style='color:{p.accent};text-decoration:none;'>{open_text}</a> &middot; "
+        )
+
+    # A real image (icons/ui/attach.png), not the U+1F4CE paperclip emoji
+    # this used to be - see the attach_button's own comment in
+    # _build_conversation_panel for why: font-glyph-fallback unreliability
+    # for that specific codepoint, verified empirically elsewhere in this
+    # file, plus pyside6-lupdate corrupting non-BMP characters extracted
+    # from Python source.
+    paperclip = _ui_icon_html("attach.png", None, 14)
     return (
         f"<div style='margin-top:4px;padding:6px;border:1px solid {p.border};"
         f"border-radius:6px;'>"
-        f"<div style='color:{p.text};font-size:12px;'>\U0001F4CE {filename}</div>"
-        f"<div style='color:{p.text_muted};font-size:11px;'>{size_text} &middot; {save_link}</div>"
+        f"<div style='color:{p.text};font-size:12px;'>{paperclip} {filename}</div>"
+        f"<div style='color:{p.text_muted};font-size:11px;'>{size_text} &middot; {open_link}{save_link}</div>"
         f"</div>"
     )
 
@@ -4264,20 +4737,6 @@ def render_bubble(msg, contact_name: str, p, note_override: str | None = None) -
     else:
         body = escape_html(msg.body).replace("\n", "<br>")
 
-    # A "Delete" link is offered only on the sender's own, still-intact,
-    # outgoing bubbles - never on an incoming message (see
-    # MainWindow._on_delete_message: only the original sender may ever
-    # delete a message, matching how the receiving side independently
-    # verifies this over the wire, in vault.py/app.py's KIND_DELETE
-    # handling, not just in this display-only check here).
-    delete_link = ""
-    if outgoing and not deleted and getattr(msg, "client_msg_id", ""):
-        delete_text = i18n.tr("Delete")  # see save_as_text's comment above on why this is not inline
-        delete_link = (
-            f" &middot; <a href='delmsg:{escape_html(msg.id)}' "
-            f"style='color:{p.text_muted};text-decoration:none;'>{delete_text}</a>"
-        )
-
     # This mapping is deliberately built from data the app already tracks
     # honestly (Message.status/.delivered/.attempts, set only when
     # transport.send_message got a real cryptographic acknowledgment from
@@ -4317,7 +4776,7 @@ def render_bubble(msg, contact_name: str, p, note_override: str | None = None) -
 
     meta = (
         f"<div style='color:{p.text_muted};font-size:11px;'>"
-        f"{who} &middot; {format_timestamp(msg.timestamp)}{delete_link}</div>"
+        f"{who} &middot; {format_timestamp(msg.timestamp)}</div>"
     )
 
     # Qt's rich-text engine does not auto-mirror raw HTML align='left'/
@@ -4340,10 +4799,19 @@ def render_bubble(msg, contact_name: str, p, note_override: str | None = None) -
             "<td width='25%'></td>"
         )
 
+    # Every row is wrapped in an invisible "msg:<id>" anchor (styled to
+    # never look like a link - no color/underline override) purely so
+    # MainWindow._on_thread_context_menu can resolve a right-click
+    # position back to which Message it landed on, via QTextBrowser's own
+    # anchorAt(pos) - the same mechanism already used for left-clicks on
+    # the real "attach:<id>" link, just covering the whole bubble instead
+    # of one small piece of text inside it.
     dir_attr = "rtl" if is_rtl else "ltr"
     return (
+        f"<a href='msg:{escape_html(msg.id)}' style='text-decoration:none;color:inherit;'>"
         f"<table width='100%' cellpadding='0' cellspacing='0' dir='{dir_attr}' "
         f"style='margin-bottom:10px;'><tr>{cells}</tr></table>"
+        f"</a>"
     )
 
 
@@ -4634,6 +5102,89 @@ def brand_image_path(filename: str) -> str | None:
     return path if os.path.exists(path) else None
 
 
+def ui_icon_path(filename: str) -> str | None:
+    """
+    Locate a small functional UI icon (verified badge, person/group
+    avatar glyph) under icons/ui/ - separate from icons/brand/'s
+    decorative illustrations, since these are load-bearing (used to mean
+    something specific: "this contact is verified", "this row is a
+    group") rather than purely cosmetic. Returns None if not found so
+    call sites can fall back to plain text, matching brand_image_path's
+    graceful-degradation convention.
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base_dir, "icons", "ui", filename)
+    return path if os.path.exists(path) else None
+
+
+_ui_icon_cache: dict[tuple[str, str | None, int], QIcon] = {}
+
+
+def ui_icon(filename: str, color: str | None, size: int = 16) -> QIcon | None:
+    """
+    Load one of icons/ui/'s PNGs, scaled to `size`x`size`, as a QIcon -
+    used for the verified badge and the person/group row glyphs.
+
+    PNG, not SVG: an SVG version of these icons was tried first and
+    dropped - QSvgRenderer needs the optional PySide6.QtSvg module, which
+    is not guaranteed present in every environment this app runs in
+    (verified empirically: missing entirely from at least one real
+    install here), so a missing-module failure silently blanked every
+    glyph down to just the plain coloured circle behind it, with no error
+    surfaced anywhere. A PNG has no such optional-module dependency.
+
+    `color`, when given, recolors every opaque pixel to that flat colour
+    while preserving each pixel's own alpha - appropriate for a
+    single-colour glyph like person.png, which needs to show up in white
+    against a coloured avatar circle regardless of what colour it was
+    drawn in. `color=None` loads the PNG's own original pixels unchanged -
+    used for group.png and verified.png, which are already the intended
+    final colour (a multi-tone illustration and the brand's own blue,
+    respectively) and would lose their real appearance if flattened to
+    one colour.
+
+    Cached per (filename, color, size) since the sidebar rebuilds its
+    rows (and therefore would otherwise re-render the same icon) every
+    time contacts/groups reload.
+    """
+    cache_key = (filename, color, size)
+    cached = _ui_icon_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    path = ui_icon_path(filename)
+    if path is None:
+        return None
+
+    source = QPixmap(path)
+    if source.isNull():
+        return None
+    source = source.scaled(
+        size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+    )
+
+    if color is not None:
+        recolored = QPixmap(source.size())
+        recolored.fill(Qt.transparent)
+        painter = QPainter(recolored)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.drawPixmap(0, 0, source)
+        # SourceIn keeps the destination's existing alpha (the glyph's own
+        # silhouette, just painted) and replaces its colour - the
+        # standard "recolor a solid glyph while keeping its transparency"
+        # QPainter composition trick, avoiding a slower per-pixel loop.
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(recolored.rect(), QColor(color))
+        painter.end()
+        pixmap = recolored
+    else:
+        pixmap = source
+
+    icon = QIcon(pixmap)
+    _ui_icon_cache[cache_key] = icon
+    return icon
+
+
 def _load_brand_pixmap(filename: str, max_size: int) -> QPixmap | None:
     """
     Load one of the brand illustrations, scaled to fit within a
@@ -4654,6 +5205,42 @@ def _load_brand_pixmap(filename: str, max_size: int) -> QPixmap | None:
     return pixmap.scaled(
         max_size, max_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
     )
+
+
+def _ui_icon_html(filename: str, color: str | None, size: int) -> str:
+    """
+    An inline <img> tag embedding one of icons/ui/'s PNGs as a base64
+    data: URI, for use inside QTextBrowser/QLabel rich text - the only
+    way to place a real image inline in Qt rich text, as opposed to a
+    QIcon on an actual QPushButton/QListWidgetItem widget. Returns "" if
+    the icon can't be loaded, so a missing asset never breaks the
+    surrounding HTML.
+    """
+    icon = ui_icon(filename, color, size)
+    if icon is None:
+        return ""
+    pixmap = icon.pixmap(size, size)
+    byte_array = QByteArray()
+    buf = QBuffer(byte_array)
+    buf.open(QBuffer.WriteOnly)
+    pixmap.save(buf, "PNG")
+    buf.close()
+    b64 = bytes(byte_array.toBase64()).decode("ascii")
+    return f"<img src='data:image/png;base64,{b64}' width='{size}' height='{size}'>"
+
+
+def _verified_badge_html(size: int = 14) -> str:
+    """
+    An inline <img> tag for the verified checkmark (icons/ui/verified.png),
+    for use inside a QLabel's auto-detected rich text (the conversation
+    header) - the sidebar's QListWidgetItem text has no rich-text/inline-
+    image support (plain QListWidget item text), so that surface instead
+    composites the same badge onto the corner of the avatar icon itself
+    (see _avatar_pixmap's caller in _reload_contacts) - two different
+    techniques for the same visual, chosen per what each specific widget
+    actually supports, not a stylistic inconsistency.
+    """
+    return _ui_icon_html("verified.png", None, size)
 
 
 def _brand_image_html(filename: str, max_size: int) -> str:
@@ -4678,6 +5265,38 @@ def _brand_image_html(filename: str, max_size: int) -> str:
 
 def main() -> None:
     app = QApplication(sys.argv)
+
+    # Force Qt's built-in "Fusion" style rather than inheriting whatever
+    # native style plugin the current desktop provides (Breeze on KDE,
+    # Kvantum, Adwaita-Qt on GNOME via qt5ct/qt6ct, etc.). Those native
+    # styles each apply their own padding/margins/hover behavior to
+    # standard widgets (QListWidget::item, QMenuBar, QPushButton...) on
+    # top of - and sometimes in place of - anything set in theme.py's
+    # stylesheet, which is how the exact same UI can look meaningfully
+    # different (or visibly broken: oversized list rows, doubled-up
+    # selection highlighting) across desktops despite identical code and
+    # an identical stylesheet. Fusion is always available (built into Qt
+    # itself, no external plugin/package needed) and applies no desktop-
+    # specific chrome of its own, so theme.py's stylesheet is the only
+    # thing controlling appearance - identical look on every Linux
+    # desktop environment (KDE, GNOME, XFCE; Kali, Fedora, Arch, ...).
+    # Must run before any QWidget is constructed, same requirement as the
+    # language installer below.
+    #
+    # theme.detect_palette() (called further down) works by inspecting
+    # app.palette()'s actual Window colour to decide light vs. dark - that
+    # colour is normally supplied by the desktop's native style (Breeze
+    # reads Plasma's colour scheme, Adwaita-Qt reads GNOME's, etc.).
+    # Fusion does NOT read the desktop theme the same way and may reset
+    # the palette to its own light-grey default the moment setStyle()
+    # runs - captured here BEFORE switching, and explicitly restored
+    # after, so "which style draws the widgets" and "which colours
+    # detect_palette sees" stay independent: switching style can never
+    # silently break dark-mode detection.
+    original_palette = app.palette()
+    app.setStyle("Fusion")
+    app.setPalette(original_palette)
+
     app.setApplicationName(version.APP_NAME)
     app.setApplicationDisplayName(version.APP_NAME)
     app.setApplicationVersion(version.__version__)

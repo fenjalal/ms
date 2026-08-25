@@ -576,8 +576,18 @@ def main() -> None:
     # attack-surface widening (Qt's rich-text renderer decoding
     # attacker-controlled image bytes automatically on receipt) as well
     # as inconsistent with every mainstream messenger's "tap/click to
-    # view" model. _attachment_html must never emit an <img> tag for any
-    # mime type, image included - only a filename/size/Save As... link.
+    # view" model. _attachment_html must never embed the ATTACHMENT'S OWN
+    # bytes (msg.body) as an <img> - only a filename/size/Save As... link.
+    #
+    # It's still allowed (and expected) to contain an <img> for the
+    # small, trusted, local paperclip icon (icons/ui/attach.png, embedded
+    # via _ui_icon_html) - that image ships with the app itself and is
+    # identical for every attachment regardless of what the message body
+    # actually contains, so it carries none of the attacker-controlled-
+    # bytes risk this test exists to catch. The real assertion is
+    # therefore "the attachment's own body never appears as image data",
+    # not "no <img> tag exists anywhere in the output" - checked by
+    # confirming msg.body's own base64 bytes are nowhere in the HTML.
     class FakeAttachmentMessage:
         id = "fake-msg-id"
         attachment_filename = "photo.jpg"
@@ -587,8 +597,10 @@ def main() -> None:
 
     fake_colors = theme.detect_palette(QApplication.instance())
     attachment_html = appmod._attachment_html(FakeAttachmentMessage(), fake_colors)
-    check("no inline <img> tag for an image attachment", "<img" not in attachment_html)
-    check("no data: URI embedded either", "data:image" not in attachment_html)
+    check(
+        "the attachment's own bytes (msg.body) are never embedded as image data",
+        FakeAttachmentMessage.body not in attachment_html,
+    )
     check("filename is still shown", "photo.jpg" in attachment_html)
     check("a Save As... link is still present", "attach:fake-msg-id" in attachment_html)
 
@@ -609,15 +621,15 @@ def main() -> None:
     icon = appmod.icon_file()
     check("resolved app icon is a real, non-null image", icon is not None and not QIcon(icon).isNull())
 
-    print("\nSidebar stays responsive at its documented minimum width (no clipped buttons):")
-    # The bug this guards against: four buttons (Add/New Group/Join
-    # Group/Remove) in one row, and separately "Share"/"Keys"/"Settings"
-    # in another, both overflowed the sidebar's minimum width and got
-    # visually clipped ("Settings" rendered as "etting"). Splitting the
-    # contact-action row into two rows and widening the documented
-    # minimum fixed it - this asserts the actual enforced minimum, not
-    # just that the code runs, so a future change that narrows it back
-    # down is caught here rather than only by eyeballing a screenshot.
+    print("\nSidebar stays responsive at its documented minimum width:")
+    # Historically this guarded against sidebar action buttons (Add/New
+    # Group/Join Group/Remove/Share/Keys/Settings) overflowing a narrow
+    # sidebar and getting visually clipped. Those buttons were removed
+    # from the sidebar entirely once every action had a top-menu-bar home
+    # (see MainWindow._build_menu_bar) - the sidebar is now just status
+    # display plus the contact/group list, so this now only asserts the
+    # enforced minimum width itself still holds (a narrow contact name
+    # like "Alice  (12)  [2 queued]" still needs room not to wrap badly).
     responsive_path = "/tmp/uitest_responsive.dat"
     try:
         os.remove(responsive_path)
@@ -634,26 +646,36 @@ def main() -> None:
     splitter = window.centralWidget().findChild(QSplitter)
     window.show()
     app.processEvents()
-    # Try to force the sidebar narrower than any button row needs - Qt
+    # Try to force the sidebar narrower than its documented minimum - Qt
     # clamps a QSplitter child to its own minimumWidth(), so the actual
     # resulting width is what matters, not the requested one.
     splitter.setSizes([50, 1230])
     app.processEvents()
     actual_sidebar_width = splitter.sizes()[0]
-    check("sidebar cannot be dragged narrower than its buttons need", actual_sidebar_width >= 290)
+    check("sidebar cannot be dragged narrower than its documented minimum", actual_sidebar_width >= 290)
 
-    # Every sidebar button's actual rendered width must fit within the
-    # enforced sidebar width - proves there's no button silently
-    # overflowing/clipping at that minimum, rather than just checking the
-    # panel's declared minimumWidth() in isolation.
-    from PySide6.QtWidgets import QPushButton
-    sidebar_buttons = [
-        w for w in window.findChildren(QPushButton)
-        if w.text() in ("Add", "Remove", "New Group", "Join Group", "Share", "Keys", "Settings")
-    ]
-    check("all expected sidebar buttons were found", len(sidebar_buttons) >= 7)
-    for button in sidebar_buttons:
-        check(f"button '{button.text()}' fits within the sidebar width", button.width() <= actual_sidebar_width)
+    print("\nTop menu bar offers every action that used to be a sidebar button:")
+    # Not a duplicate of the check above - this is the *replacement* for
+    # the old per-button overflow check, proving each action actually has
+    # a menu-bar home now rather than having quietly disappeared when the
+    # sidebar buttons were removed.
+    menu_bar = window.menuBar()
+    top_level = {a.text(): a for a in menu_bar.actions()}
+    for name in ("Contact", "Group", "Share", "Keys", "Settings", "Help"):
+        check(f"menu bar has a top-level '{name}' menu", name in top_level)
+
+    def submenu_texts(menu_name: str) -> set[str]:
+        action = top_level.get(menu_name)
+        submenu = action.menu() if action else None
+        return {a.text() for a in submenu.actions()} if submenu else set()
+
+    check("Contact menu offers Add…", "Add…" in submenu_texts("Contact"))
+    check("Contact menu offers Remove", "Remove" in submenu_texts("Contact"))
+    check("Group menu offers New Group…", "New Group…" in submenu_texts("Group"))
+    check("Group menu offers Join Group…", "Join Group…" in submenu_texts("Group"))
+    check("Share menu offers Share Contact…", "Share Contact…" in submenu_texts("Share"))
+    check("Keys menu offers View Keys…", "View Keys…" in submenu_texts("Keys"))
+    check("Settings menu offers Preferences…", "Preferences…" in submenu_texts("Settings"))
 
     window.close()
     try:

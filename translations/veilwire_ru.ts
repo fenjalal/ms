@@ -10,7 +10,7 @@
     <message>
         <location filename="../app.py" line="4438" />
         <source>%(version)s - open source (%(license)s)</source>
-        <translation>%(version)s — открытый исходный код (%(license)s)</translation>
+        <translation>%(version)s  открытый исходный код (%(license)s)</translation>
     </message>
     <message>
         <location filename="../app.py" line="4448" />
@@ -20,7 +20,7 @@
     <message>
         <location filename="../app.py" line="4451" />
         <source>No servers, no accounts, no phone numbers. Your public key and fingerprint are your whole identity. Messages are end-to-end encrypted, and every connection is routed anonymously through the Tor network, so no one - not even Veilwire - can see who you're talking to.</source>
-        <translation>Никаких серверов, учётных записей или номеров телефонов. Ваш открытый ключ и отпечаток — это вся ваша идентичность. Сообщения защищены сквозным шифрованием, а каждое соединение анонимно маршрутизируется через сеть Tor, так что никто — даже Veilwire — не может увидеть, с кем вы общаетесь.</translation>
+        <translation>Никаких серверов, учётных записей или номеров телефонов. Ваш открытый ключ и отпечаток  это вся ваша идентичность. Сообщения защищены сквозным шифрованием, а каждое соединение анонимно маршрутизируется через сеть Tor, так что никто  даже Veilwire  не может увидеть, с кем вы общаетесь.</translation>
     </message>
     <message>
         <location filename="../app.py" line="4459" />
@@ -141,7 +141,7 @@
     <message>
         <location filename="../app.py" line="724" />
         <source>Anyone holding your contact bundle can send you a first message. Read your fingerprint aloud to a contact so they can confirm they have the real you and not an impostor. Your exact connection details stay internal to the app and are never shown directly - share your contact instead.</source>
-        <translation>Любой, у кого есть ваш пакет контакта, может отправить вам первое сообщение. Прочитайте свой отпечаток вслух собеседнику, чтобы он мог убедиться, что общается именно с вами, а не с самозванцем. Точные данные вашего соединения остаются внутри приложения и никогда не показываются напрямую — вместо этого делитесь своим контактом.</translation>
+        <translation>Любой, у кого есть ваш пакет контакта, может отправить вам первое сообщение. Прочитайте свой отпечаток вслух собеседнику, чтобы он мог убедиться, что общается именно с вами, а не с самозванцем. Точные данные вашего соединения остаются внутри приложения и никогда не показываются напрямую  вместо этого делитесь своим контактом.</translation>
     </message>
     <message>
         <location filename="../app.py" line="735" />
@@ -151,7 +151,7 @@
     <message>
         <location filename="../app.py" line="739" />
         <source>Shows a QR code and a copyable bundle a contact can scan or paste to add you - without exposing your connection details.</source>
-        <translation>Показывает QR-код и копируемый пакет, который контакт может отсканировать или вставить, чтобы добавить вас — без раскрытия данных вашего соединения.</translation>
+        <translation>Показывает QR-код и копируемый пакет, который контакт может отсканировать или вставить, чтобы добавить вас  без раскрытия данных вашего соединения.</translation>
     </message>
     <message>
         <location filename="../app.py" line="747" />
@@ -388,7 +388,7 @@ This cannot be undone.</source>
     </message>
     <message>
         <source>QR code and copyable bundle a contact can scan or paste to add you - never your onion address in the clear.</source>
-        <translation type="vanished">QR-код и копируемый пакет, который контакт может отсканировать или вставить, чтобы добавить вас — ваш onion-адрес никогда не отображается в открытом виде.</translation>
+        <translation type="vanished">QR-код и копируемый пакет, который контакт может отсканировать или вставить, чтобы добавить вас  ваш onion-адрес никогда не отображается в открытом виде.</translation>
     </message>
     <message>
         <source>Keys...</source>
@@ -713,7 +713,7 @@ This only removes it from your own device - other members keep their own copy of
     <message>
         <location filename="../app.py" line="2140" />
         <source>This invite is signed and works only once, for this one group. Send it only to the person you want to add - anyone who redeems it before they do will use it up.</source>
-        <translation>Это приглашение подписано и действует только один раз, только для этой группы. Отправляйте его только тому человеку, которого хотите добавить, — если кто-то другой воспользуется им раньше, приглашение будет израсходовано.</translation>
+        <translation>Это приглашение подписано и действует только один раз, только для этой группы. Отправляйте его только тому человеку, которого хотите добавить,  если кто-то другой воспользуется им раньше, приглашение будет израсходовано.</translation>
     </message>
     <message>
         <location filename="../app.py" line="2144" />
@@ -832,7 +832,7 @@ Compare this fingerprint with them over a channel you trust.</source>
     <message>
         <location filename="../app.py" line="2463" />
         <source>The app will not automatically trust the new connection information. Confirm the fingerprint with them over a channel you already trust before continuing - if it does not match what you verified before, reject this.</source>
-        <translation>Приложение не будет автоматически доверять новым данным соединения. Прежде чем продолжить, сверьте отпечаток с собеседником через канал, которому вы уже доверяете — если он не совпадает с тем, что вы проверяли ранее, отклоните это.</translation>
+        <translation>Приложение не будет автоматически доверять новым данным соединения. Прежде чем продолжить, сверьте отпечаток с собеседником через канал, которому вы уже доверяете  если он не совпадает с тем, что вы проверяли ранее, отклоните это.</translation>
     </message>
     <message>
         <location filename="../app.py" line="2469" />
@@ -866,13 +866,13 @@ Compare this fingerprint with them over a channel you trust.</source>
     </message>
     <message>
         <location filename="../app.py" line="2498" />
-        <source> — online</source>
-        <translation> — в сети</translation>
+        <source>  online</source>
+        <translation>  в сети</translation>
     </message>
     <message>
         <location filename="../app.py" line="2500" />
-        <source> — offline</source>
-        <translation> — не в сети</translation>
+        <source>  offline</source>
+        <translation>  не в сети</translation>
     </message>
     <message>
         <location filename="../app.py" line="2514" />
@@ -1171,7 +1171,7 @@ Re-encoding fully decodes the image and rebuilds it from scratch, discarding any
     <message>
         <location filename="../app.py" line="1062" />
         <source>When off, only contacts you already added can message you - anyone else's first message is silently ignored instead of showing up as a request.</source>
-        <translation>Если отключено, писать вам смогут только уже добавленные контакты — первое сообщение от кого-либо ещё будет молча проигнорировано, а не появится как запрос.</translation>
+        <translation>Если отключено, писать вам смогут только уже добавленные контакты  первое сообщение от кого-либо ещё будет молча проигнорировано, а не появится как запрос.</translation>
     </message>
 </context>
 <context>
@@ -1184,7 +1184,7 @@ Re-encoding fully decodes the image and rebuilds it from scratch, discarding any
     <message>
         <location filename="../app.py" line="1162" />
         <source>This bundle is signed, not encrypted: it proves it came from this identity and cannot be modified without detection, but anyone who has it can read what's inside - same as sharing an address today. Send it only to people you intend to give your contact information to.</source>
-        <translation>Этот пакет подписан, но не зашифрован: он подтверждает, что исходит от этой личности, и его нельзя изменить незаметно, но любой, у кого он есть, может прочитать его содержимое — как и при обмене обычным адресом. Отправляйте его только тем, кому действительно хотите передать свою контактную информацию.</translation>
+        <translation>Этот пакет подписан, но не зашифрован: он подтверждает, что исходит от этой личности, и его нельзя изменить незаметно, но любой, у кого он есть, может прочитать его содержимое  как и при обмене обычным адресом. Отправляйте его только тем, кому действительно хотите передать свою контактную информацию.</translation>
     </message>
     <message>
         <location filename="../app.py" line="1173" />

@@ -1,6 +1,6 @@
 # onionmsg v0.0.1
 
-*Open source (MIT). Alpha — see Limitations before relying on it.*
+*Open source (MIT). Alpha  see Limitations before relying on it.*
 
 Peer-to-peer encrypted messaging over Tor. No servers, no accounts, no email,
 no phone numbers, no third-party services of any kind.
@@ -48,7 +48,7 @@ share is a **contact bundle** (below), and what a contact verifies you by is
 your **fingerprint**.
 
 Anyone holding your contact bundle can send you a **first message**. It
-arrives as a **request**, not a delivered message — you see their fingerprint
+arrives as a **request**, not a delivered message  you see their fingerprint
 and choose to accept or block. Nothing enters a conversation until you
 decide. If you would rather nobody can reach you unsolicited, turn off "Let
 anyone with my address send a first message" in **Keys...**.
@@ -63,17 +63,17 @@ everything they need to reach you.
 This bundle is **signed, not encrypted**:
 
 - It is authenticated with your signing key, so a bundle that has been
-  modified in any way — a different onion, a different public key, a
-  swapped fingerprint — fails to verify and is rejected outright. This is
+  modified in any way  a different onion, a different public key, a
+  swapped fingerprint  fails to verify and is rejected outright. This is
   what stops an attacker from intercepting your bundle and quietly
   redirecting a contact's messages to their own onion service instead.
 - It is **not** confidential. Anyone who has the raw bundle text or QR
-  image — a screenshot, an intercepted paste — can decode the onion address,
+  image  a screenshot, an intercepted paste  can decode the onion address,
   public key, and fingerprint inside it. There is no way around this for a
   first-time share: encrypting it would require a key belonging to a
   recipient you have no relationship with yet, which does not exist at
   share time. This is the same exposure the old plaintext
-  `onionmsg:<onion>:<public key>` address always had — the bundle format
+  `onionmsg:<onion>:<public key>` address always had  the bundle format
   does not make that worse, it just stops the onion from being printed in
   the clear across the app's normal screens.
 - Treat a copied bundle or a screenshot of its QR code the way you'd treat
@@ -83,14 +83,14 @@ This bundle is **signed, not encrypted**:
   it.
 
 The legacy plaintext address (`onionmsg:<onion>:<public key>`) still works
-if someone gives you one directly — **Add Contact** accepts either format
+if someone gives you one directly  **Add Contact** accepts either format
 pasted into the same box.
 
 ### Verify fingerprints
 
 This is the one step no code can do for you. Before trusting a contact, read
-your fingerprint to them over a channel you already trust — a phone call, in
-person — and have them read theirs back. Matching fingerprints prove you hold
+your fingerprint to them over a channel you already trust  a phone call, in
+person  and have them read theirs back. Matching fingerprints prove you hold
 each other's real keys and there is no man in the middle. Verified contacts
 show a checkmark.
 
@@ -99,12 +99,12 @@ show a checkmark.
 If someone you have already added sends a bundle claiming the same public
 key but a different onion address, the app does **not** silently switch to
 the new endpoint. It shows a **"⚠ Identity / Endpoint Changed"** warning
-instead of a routine contact request, with only the fingerprint shown — not
-the onion, even here — and lets you **Review** (treat it like a fresh
+instead of a routine contact request, with only the fingerprint shown  not
+the onion, even here  and lets you **Review** (treat it like a fresh
 request) or **Reject** it. This covers both an identity that legitimately
 moved (e.g. they restored a backup or regenerated their identity onto the
 same key by mistake) and an attacker who has taken over the old onion
-address and is trying to be treated as the existing contact — the app
+address and is trying to be treated as the existing contact  the app
 cannot tell those apart on its own, so it asks you.
 
 ### Backup
@@ -119,10 +119,10 @@ a password vault.
 
 ### Two layers of encryption
 
-1. **Tor onion service** — the connection itself is end-to-end encrypted and
+1. **Tor onion service**  the connection itself is end-to-end encrypted and
    authenticated by Tor, with no exit node involved. Traffic never touches the
    clear internet.
-2. **NaCl Box (X25519 + XSalsa20-Poly1305)** — the message body is separately
+2. **NaCl Box (X25519 + XSalsa20-Poly1305)**  the message body is separately
    encrypted to your contact's public key *before* it enters the tunnel.
 
 Layer 2 means that even a flaw in layer 1, or a malicious relay, still cannot
@@ -132,7 +132,7 @@ there is no separate signature step to get wrong.
 
 ### Local storage
 
-Everything on disk — your identity keys, contacts, and full message history —
+Everything on disk  your identity keys, contacts, and full message history —
 lives in a single `vault.dat`, encrypted with a key derived from your
 passphrase using Argon2id. Copying the file gives an attacker nothing but its
 size. The file is written `0600` and is git-ignored.
@@ -151,7 +151,7 @@ app detects your distribution and either uses the Tor you already have or
 starts its own private instance, then publishes the onion service itself.
 
 If Tor is missing, the app tells you the exact install command for *your*
-distribution — `apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`, or `emerge`.
+distribution  `apt`, `dnf`, `pacman`, `zypper`, `apk`, `xbps`, or `emerge`.
 
 ## Install
 
@@ -164,7 +164,7 @@ sudo apt install ./veilwire_1.0.0_amd64.deb
 **Use `apt install ./file.deb`, not `sudo dpkg -i file.deb`.** This is the
 one thing people get wrong most often with any `.deb` that has
 dependencies (this is normal, standard `apt`/`dpkg` behavior, not specific
-to Veilwire): `dpkg -i` only unpacks the file you give it — it does **not**
+to Veilwire): `dpkg -i` only unpacks the file you give it  it does **not**
 go fetch missing dependencies (`python3-stem`, `python3-segno`, etc.) from
 your distro's repositories, so it fails with "dependency problems" if any
 of them aren't already installed. `apt install ./file.deb` resolves and
@@ -185,7 +185,7 @@ Once installed, launch **Veilwire** from your application menu, or run:
 veilwire
 ```
 
-No `python3 app.py`, no virtualenv, no manual `pip install` — the package
+No `python3 app.py`, no virtualenv, no manual `pip install`  the package
 declares its dependencies on your distribution's own Python packages
 (PySide6, PyNaCl, stem, PySocks, segno) and Tor, so `apt` installs
 everything needed in one step.
@@ -193,7 +193,7 @@ everything needed in one step.
 ### Other formats
 
 `.rpm` (Fedora/RHEL/Rocky/AlmaLinux), an Arch package, an AppImage, and a
-Flatpak are also supported from the same source — see
+Flatpak are also supported from the same source  see
 [`packaging/`](packaging/) and run `./build.sh <format>` to build them, or
 `./build.sh all` to build every format your machine has the tooling for.
 Once built:
@@ -219,7 +219,7 @@ python3 app.py
 ## Run
 
 Installed via a package: run `veilwire` or launch it from your
-application menu — that's it.
+application menu  that's it.
 
 Running from a source checkout: `python3 app.py`.
 
@@ -234,21 +234,21 @@ A coloured dot at the bottom shows your real state:
 | Dot | Meaning |
 |-----|---------|
 | Green | Online, onion service published and registered |
-| — | Contacts show `●` when their app is open, `○` when it is closed |
-| Amber | Working on it — bootstrapping, no circuits yet, or republishing |
+|  | Contacts show `●` when their app is open, `○` when it is closed |
+| Amber | Working on it  bootstrapping, no circuits yet, or republishing |
 | Red | Tor is down, or the listener stopped |
 | Grey | Starting up |
 
 **Check now** runs a full end-to-end test: it connects to your *own* onion
 address through Tor, exactly as a contact would. This is the only check that
-proves the whole path works — Tor thinking it is fine is not the same as
+proves the whole path works  Tor thinking it is fine is not the same as
 actually being reachable.
 
 ### Talking to someone
 
 1. Click **Share Contact...** and let them scan the QR code, or copy the
    bundle and send it to them over any channel you already trust (in person,
-   Signal, a call — see the warning below).
+   Signal, a call  see the warning below).
 2. They do the same.
 3. Each of you clicks **Add**, pastes the other's bundle (or address), and
    gives it a name.
@@ -257,7 +257,7 @@ actually being reachable.
 **Both of you must have the app open at the same time.** There is no server
 storing messages for later, so if your contact is offline the send fails and
 is marked "Not delivered" in the thread. This is a direct consequence of
-having no infrastructure — see Limitations.
+having no infrastructure  see Limitations.
 
 ### Sending a file or image
 
@@ -402,7 +402,7 @@ These are design consequences, not bugs:
 
 - **Delivery needs an overlap, not simultaneity.** A message sent to an
   offline contact is **queued**, encrypted, in your own vault, and the app
-  keeps retrying until their onion service answers — so closing their app no
+  keeps retrying until their onion service answers  so closing their app no
   longer loses the message. What is still required is that *your* app is open
   at some moment while they are online. If you send and immediately quit for a
   week, the message waits for you to come back.
@@ -411,15 +411,15 @@ These are design consequences, not bugs:
   are away. That means either a relay you run (see "Always-on node" below) or
   untrusted store-and-forward infrastructure like Cwtch's. A blockchain is the
   wrong tool: it is a permanent, public, fully-replicated log, which is the
-  opposite of what private messaging wants — the ciphertext would sit there
+  opposite of what private messaging wants  the ciphertext would sit there
   forever, readable retroactively the day the encryption breaks, with sender
   timing and message sizes visible to everyone.
 
 ### Always-on node
 
 The simplest real fix for offline delivery is to be online all the time. Run
-onionmsg on a machine that never sleeps — a VPS, a Raspberry Pi, a home
-server — and your address is always reachable. Your identity lives in
+onionmsg on a machine that never sleeps  a VPS, a Raspberry Pi, a home
+server  and your address is always reachable. Your identity lives in
 `vault.dat`, so restore an identity backup there and it *is* you.
 - **Group chat has no shared roster.** A group is a local label each member
   sets up on their own side over their existing 1:1 contacts (see
@@ -435,7 +435,7 @@ server — and your address is always reachable. Your identity lives in
   three relays.
 - **Desktop Linux only.**
 - **This is not audited software.** The cryptography comes from libsodium via
-  PyNaCl and the transport from Tor — both well reviewed — but the code
+  PyNaCl and the transport from Tor  both well reviewed  but the code
   gluing them together here is not. If your safety genuinely depends on it,
   use [Ricochet Refresh](https://www.ricochetrefresh.net/) or
   [Cwtch](https://cwtch.im/) instead; they implement this same model and have
@@ -520,14 +520,14 @@ transport is the real production code path.
 
 ## Troubleshooting
 
-**Which Tor does it use?** — If you already have Tor running with a reachable
+**Which Tor does it use?**  If you already have Tor running with a reachable
 control port (9051, or 9151 for Tor Browser), the app attaches to it and says
 "Online via your existing Tor". Otherwise it starts a private instance. Either
 way the status bar tells you which.
 
-**"Tor is not installed"** — `sudo apt install tor`.
+**"Tor is not installed"**  `sudo apt install tor`.
 
-**"Found Tor on control port 9051, but could not authenticate"** — Tor is
+**"Found Tor on control port 9051, but could not authenticate"**  Tor is
 running but your user is not allowed to control it. Either join Tor's group:
 
 ```bash
@@ -548,33 +548,33 @@ ControlPort 9051
 CookieAuthentication 1
 ```
 
-**Startup hangs on "Bootstrapped"** — Tor is still connecting. First run can
+**Startup hangs on "Bootstrapped"**  Tor is still connecting. First run can
 take a minute or two. If it never finishes, Tor may be blocked on your
 network; configure a bridge.
 
-**"They are probably offline"** — expected when your contact does not have the
+**"They are probably offline"**  expected when your contact does not have the
 app running. Both sides must be online at once.
 
-**Address changed after reinstalling** — the onion key lives in `vault.dat`.
+**Address changed after reinstalling**  the onion key lives in `vault.dat`.
 Delete or lose that file and you get a new identity, and contacts must re-add
 you.
 
-**`TypeError: '_thread._ThreadHandle' object is not callable`** — fixed. This
+**`TypeError: '_thread._ThreadHandle' object is not callable`**  fixed. This
 came from a method name colliding with a private attribute added in Python
 3.13. `test_py313.py` guards against it returning. Make sure you are running
 the current version.
 
-**Messages look blank or unreadable** — fixed in v0.0.1. Bubbles previously
+**Messages look blank or unreadable**  fixed in v0.0.1. Bubbles previously
 inherited their text colour from the system palette, which made them invisible
 on dark desktops. Colours are now always set in pairs and verified by
 `test_ui.py` under both light and dark themes.
 
-**"Queued - they are offline"** — expected. Their app is closed. Yours will
+**"Queued - they are offline"**  expected. Their app is closed. Yours will
 keep retrying every 45 seconds and deliver as soon as they open it, as long as
 your app is still running. Nothing is lost if you quit; the queue is saved and
 resumes on next launch.
 
-**Forgot the passphrase** — there is no recovery. That is the point. Delete
+**Forgot the passphrase**  there is no recovery. That is the point. Delete
 `vault.dat` and start over with a new identity.
 
 ## Security reporting

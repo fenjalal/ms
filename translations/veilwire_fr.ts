@@ -866,13 +866,13 @@ Comparez cette empreinte avec cette personne via un canal de confiance.</transla
     </message>
     <message>
         <location filename="../app.py" line="2498" />
-        <source> — online</source>
-        <translation> — en ligne</translation>
+        <source>  online</source>
+        <translation>  en ligne</translation>
     </message>
     <message>
         <location filename="../app.py" line="2500" />
-        <source> — offline</source>
-        <translation> — hors ligne</translation>
+        <source>  offline</source>
+        <translation>  hors ligne</translation>
     </message>
     <message>
         <location filename="../app.py" line="2514" />

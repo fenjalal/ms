@@ -31,6 +31,19 @@
 # flatpak-builder) is not installed on the current machine are reported
 # clearly as skipped-with-a-reason, never silently skipped and never
 # falsely reported as built.
+#
+# Every successful invocation (single format or "all") writes/refreshes
+# dist/SHA256SUMS covering every package currently in dist/, so anyone
+# who downloads a package later can verify it hasn't been altered (see
+# GUIDE.md's "Verifying your download" section for the user-facing
+# instructions). Set VEILWIRE_GPG_KEY to a key id/email already present
+# in the local GPG keyring to also produce a detached signature,
+# dist/SHA256SUMS.asc, over that checksum file - e.g.:
+#
+#   VEILWIRE_GPG_KEY=release@veilwire.example ./build.sh all --version 1.1.0
+#
+# Left unset, checksums are still written but not signed - a normal dev
+# build never needs a signing key configured and never prompts for one.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -184,9 +197,41 @@ build_flatpak() {
 }
 
 write_checksums() {
-    if compgen -G "$DIST_DIR"/*.deb "$DIST_DIR"/*.rpm "$DIST_DIR"/*.pkg.tar.zst "$DIST_DIR"/*.AppImage "$DIST_DIR"/*.flatpak >/dev/null 2>&1; then
-        (cd "$DIST_DIR" && sha256sum -- *.deb *.rpm *.pkg.tar.zst *.AppImage *.flatpak 2>/dev/null > SHA256SUMS || true)
-        echo "Checksums written to $DIST_DIR/SHA256SUMS"
+    # Every package format's build script drops its output straight into
+    # $DIST_DIR - this recomputes SHA256SUMS from whatever is actually
+    # there right now, so it's correct whether "all" just built five
+    # formats in one run or a single target (e.g. "./build.sh deb") was
+    # run on its own. Previously this only ran from the "all" branch,
+    # meaning a single-format build (the common case for a maintainer
+    # re-cutting just one package after a fix) silently shipped with no
+    # checksum file at all - fixed by calling this from every branch, not
+    # just "all".
+    local pkgs=()
+    shopt -s nullglob
+    pkgs=("$DIST_DIR"/*.deb "$DIST_DIR"/*.rpm "$DIST_DIR"/*.pkg.tar.zst "$DIST_DIR"/*.AppImage "$DIST_DIR"/*.flatpak)
+    shopt -u nullglob
+    if [ "${#pkgs[@]}" -eq 0 ]; then
+        return 0
+    fi
+    (
+        cd "$DIST_DIR"
+        sha256sum -- "${pkgs[@]##*/}" > SHA256SUMS
+    )
+    echo "Checksums written to $DIST_DIR/SHA256SUMS"
+
+    # Optional GPG signature over the checksum file itself (not each
+    # package individually - signing SHA256SUMS transitively covers every
+    # package listed in it with one signature, the same pattern most
+    # projects that publish reproducible-ish release artifacts use).
+    # Entirely opt-in: only runs if the maintainer has already configured
+    # a signing key via VEILWIRE_GPG_KEY, so a normal dev build never
+    # prompts for a passphrase or fails when no key is set up.
+    if [ -n "${VEILWIRE_GPG_KEY:-}" ] && command -v gpg >/dev/null 2>&1; then
+        (cd "$DIST_DIR" && gpg --batch --yes --local-user "$VEILWIRE_GPG_KEY" \
+            --detach-sign --armor -o SHA256SUMS.asc SHA256SUMS)
+        echo "Signature written to $DIST_DIR/SHA256SUMS.asc (key: $VEILWIRE_GPG_KEY)"
+    else
+        echo "NOTE: SHA256SUMS not GPG-signed (set VEILWIRE_GPG_KEY to a key id/email to sign)"
     fi
 }
 
@@ -217,11 +262,11 @@ main() {
     mkdir -p "$DIST_DIR"
 
     case "$target" in
-        deb)      build_deb ;;
-        rpm)      build_rpm ;;
-        arch)     build_arch ;;
-        appimage) build_appimage ;;
-        flatpak)  build_flatpak ;;
+        deb)      build_deb;      write_checksums ;;
+        rpm)      build_rpm;      write_checksums ;;
+        arch)     build_arch;     write_checksums ;;
+        appimage) build_appimage; write_checksums ;;
+        flatpak)  build_flatpak;  write_checksums ;;
         all)
             local results=()
             for fn in build_deb build_rpm build_arch build_appimage build_flatpak; do

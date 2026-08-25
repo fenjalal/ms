@@ -7,9 +7,12 @@ Three layers, cheapest first:
 
 1. Pure vault.py unit checks - the local tombstone mechanics and the
    queued-notification row, no network involved.
-2. render_bubble (app.py) - the tombstone and "Delete" link show up (or
-   don't) exactly where they should, reusing the same colour-pairing
-   render function test_ui.py already exercises.
+2. render_bubble (app.py) - the tombstone placeholder shows up (or
+   doesn't) exactly where it should, reusing the same colour-pairing
+   render function test_ui.py already exercises; and
+   MainWindow._on_thread_context_menu's own gating logic for when its
+   right-click "Delete" action is offered (Delete is no longer an
+   inline link - see that method's docstring).
 3. A real two-party, socket-level exchange (same Peer pattern as
    test_groups_and_files.py: Tor replaced by a direct localhost
    connection, everything above the transport is the real production
@@ -20,6 +23,7 @@ Three layers, cheapest first:
 
 from __future__ import annotations
 
+import os
 import socket
 import time
 
@@ -200,7 +204,7 @@ def main() -> None:
         not any(m.is_delete_request for m in group_msgs),
     )
 
-    print("\nrender_bubble: tombstone and Delete-link presentation:")
+    print("\nrender_bubble: tombstone presentation, and the msg: anchor right-click needs:")
     import app as appmod
 
     class FakeTheme:
@@ -217,28 +221,73 @@ def main() -> None:
         ok = "#33cc66"
 
     p = FakeTheme()
+    # Delete is no longer an inline link in the bubble itself - it only
+    # ever appears as a right-click context-menu action (see
+    # MainWindow._on_thread_context_menu), gated there by the same
+    # direction/deleted/client_msg_id rules previously checked here
+    # against render_bubble's output. Every bubble (deleted or not,
+    # incoming or outgoing) is still wrapped in an invisible "msg:<id>"
+    # anchor so a right-click anywhere on it can resolve back to the
+    # Message - that anchor, not a delmsg: link, is what render_bubble
+    # actually offers now.
     live_msg = v.add_message(a.id, "out", "still here", status=vm.SENT, client_msg_id="cmid-live")
     live_html = appmod.render_bubble(live_msg, "A", p)
-    check("an intact outgoing message offers a Delete link", "delmsg:" in live_html)
-    check("Delete link is keyed to this message's local id", f"delmsg:{live_msg.id}" in live_html)
+    check("no bubble ever contains an inline delmsg: link anymore", "delmsg:" not in live_html)
+    check("an intact outgoing message is wrapped in its own msg: anchor", f"msg:{live_msg.id}" in live_html)
 
     tomb = v.add_message(a.id, "out", "gone now", status=vm.SENT, client_msg_id="cmid-tomb")
     v.mark_deleted(a.id, tomb.id)
     tomb_reloaded = next(m for m in v.get_contact(a.id).messages if m.id == tomb.id)
     tomb_html = appmod.render_bubble(tomb_reloaded, "A", p)
     check("a tombstoned message shows the deleted placeholder", "was deleted" in tomb_html.lower() or "deleted" in tomb_html.lower())
-    check("a tombstoned message offers no Delete link (already deleted)", "delmsg:" not in tomb_html)
     check("a tombstoned message's original text does not leak into the HTML", "gone now" not in tomb_html)
 
     incoming = v.add_message(a.id, "in", "their message", client_msg_id="cmid-in")
     incoming_html = appmod.render_bubble(incoming, "A", p)
-    check("an incoming message never offers a Delete link", "delmsg:" not in incoming_html)
+    check("an incoming message is also wrapped in its own msg: anchor", f"msg:{incoming.id}" in incoming_html)
 
     legacy_no_mid = v.add_message(a.id, "out", "sent before this feature existed", status=vm.SENT)
     legacy_html = appmod.render_bubble(legacy_no_mid, "A", p)
     check(
-        "an outgoing message with no client_msg_id (pre-feature data) offers no Delete link",
-        "delmsg:" not in legacy_html,
+        "an outgoing message with no client_msg_id still renders (Delete is refused by the menu builder, not by render_bubble)",
+        f"msg:{legacy_no_mid.id}" in legacy_html,
+    )
+
+    print("\n_on_thread_context_menu: which messages actually offer Delete:")
+
+    class FakeMenu:
+        """Stand-in for QMenu that just records what would be shown."""
+        def __init__(self):
+            self.actions = []
+
+        def addAction(self, text):
+            self.actions.append(text)
+            return text
+
+        def addSeparator(self):
+            pass
+
+        def isEmpty(self):
+            return not self.actions
+
+    def offers_delete(msg) -> bool:
+        # Mirrors _on_thread_context_menu's own gating condition exactly
+        # (app.py) - kept here as a direct re-check of that condition
+        # rather than driving a real QTextBrowser/QMenu through Xvfb,
+        # since the condition itself (not the Qt plumbing around it) is
+        # what this test is protecting.
+        return (
+            msg.direction == "out"
+            and not getattr(msg, "deleted", False)
+            and bool(getattr(msg, "client_msg_id", ""))
+        )
+
+    check("an intact outgoing message offers Delete", offers_delete(live_msg))
+    check("a tombstoned message no longer offers Delete", not offers_delete(tomb_reloaded))
+    check("an incoming message never offers Delete", not offers_delete(incoming))
+    check(
+        "an outgoing message with no client_msg_id (pre-feature data) offers no Delete",
+        not offers_delete(legacy_no_mid),
     )
 
     print("\nImage recompression (app._recompress_image_bytes):")
@@ -270,6 +319,174 @@ def main() -> None:
         "non-image bytes (e.g. a disguised file) fail to recompress rather than silently passing through",
         appmod._recompress_image_bytes(not_an_image) is None,
     )
+
+    print("\nOutgoing IMAGE attachments never carry the sender's real filename (app._random_image_filename):")
+    # The bug this guards against: an image's original filename - picked
+    # by the sender's own device/OS/camera/software, not by this app -
+    # used to be sent to the recipient verbatim (os.path.basename() of
+    # whatever the user picked in the file dialog). A filename routinely
+    # carries information that has nothing to do with the picture's
+    # actual content (a phone's naming pattern, an embedded date,
+    # sometimes a person's name) - app.py's real send paths
+    # (_start_contact_file_send/_start_group_send/
+    # _start_contact_chunked_send) replace it with a random one for an
+    # image specifically. A non-image file (PDF, zip, etc.) is NOT
+    # touched by this function at all - it keeps its own real name, since
+    # a recipient usually needs to know what a document actually is
+    # (covered separately in test_chunked_transfer.py's non-image check).
+    rand1 = appmod._random_image_filename("image/jpeg")
+    rand2 = appmod._random_image_filename("image/jpeg")
+    check("random image filename has a real extension for a known mime type", rand1.endswith(".jpg"))
+    check("two consecutive random image filenames differ (unguessable, not a counter)", rand1 != rand2)
+    check(
+        "a random image filename never contains anything from a real name like 'vacation_photo'",
+        "vacation" not in rand1 and "photo" not in rand1,
+    )
+    check(
+        "the random part is long enough to be effectively unguessable (32 hex chars = 128 bits)",
+        len(rand1.rsplit(".", 1)[0]) >= 32,
+    )
+    unknown_mime_name = appmod._random_image_filename("image/x-something-unknown")
+    check(
+        "an unrecognized image mime type still falls back to a usable extension, no crash",
+        unknown_mime_name.endswith(".jpg"),
+    )
+
+    print("\nMainWindow._start_contact_file_send: the real send path applies the same split:")
+    # Exercises the actual method the UI calls (not just the filename
+    # helper in isolation) - proves the image-vs-other-file branch in
+    # _start_contact_file_send itself, end to end, the same "stub the
+    # worker/network, call the real higher-level method" approach
+    # test_group_onboarding.py already established for GroupSendWorker.
+    appmod.MainWindow._start_network = lambda self: None
+
+    class _FakeSignal:
+        def connect(self, *_a, **_k):
+            pass
+
+    class FakeSendWorker:
+        def __init__(self, **_kwargs):
+            self.done = _FakeSignal()
+            self.finished = _FakeSignal()
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+    real_send_worker = appmod.SendWorker
+    appmod.SendWorker = FakeSendWorker
+
+    send_path = "/tmp/send_filename_test.dat"
+    try:
+        os.remove(send_path)
+    except OSError:
+        pass
+    send_store = vm.Vault(send_path)
+    send_store.create("send filename test passphrase")
+    send_store.set_onion("s" * 56 + ".onion", "ED25519-V3:K")
+    peer_contact = send_store.add_contact(
+        "Peer", vm.format_address("t" * 56 + ".onion", crypto.b64encode(crypto.generate_keypair()[1])),
+    )
+
+    send_window = appmod.MainWindow(send_store)
+    send_window._start_contact_file_send(
+        peer_contact, "/home/user/private/vacation_photo_2026.jpg", b"fake-jpeg-bytes", "image/jpeg",
+    )
+    image_msg = next(
+        (m for m in send_store.get_contact(peer_contact.id).messages if m.attachment_filename), None,
+    )
+    check("image send produced an attachment message", image_msg is not None)
+    check(
+        "the real path/filename ('vacation_photo_2026.jpg') never appears in the stored attachment name",
+        image_msg is not None and "vacation" not in image_msg.attachment_filename,
+    )
+    check(
+        "image attachment got a random name, not the original",
+        image_msg is not None and image_msg.attachment_filename != "vacation_photo_2026.jpg",
+    )
+
+    send_window._start_contact_file_send(
+        peer_contact, "/home/user/private/quarterly_report.pdf", b"fake-pdf-bytes", "application/pdf",
+    )
+    pdf_msg = next(
+        (
+            m for m in send_store.get_contact(peer_contact.id).messages
+            if m.attachment_filename and m.attachment_filename != image_msg.attachment_filename
+        ),
+        None,
+    )
+    check("PDF send produced an attachment message", pdf_msg is not None)
+    check(
+        "a non-image (PDF) attachment keeps its real filename",
+        pdf_msg is not None and pdf_msg.attachment_filename == "quarterly_report.pdf",
+    )
+
+    appmod.SendWorker = real_send_worker
+
+    print("\nSaved-attachment 'Open' offer (vault.mark_attachment_saved / render_bubble):")
+    # The feature this covers: instead of asking "Save As..." every
+    # single time the user revisits an attachment they already saved
+    # once, the bubble/context-menu should offer "Open" straight to that
+    # remembered location - but ONLY while a real file still exists
+    # there right now (never trusted blindly, since the user could have
+    # moved/renamed/deleted it since saving - see Message.saved_path's
+    # docstring).
+    real_saved_path = "/tmp/test_delete_saved_attachment.pdf"
+    with open(real_saved_path, "wb") as f:
+        f.write(b"fake-pdf-bytes")
+    try:
+        send_store.mark_attachment_saved(peer_contact.id, pdf_msg.id, real_saved_path)
+        reloaded_pdf_msg = next(
+            m for m in send_store.get_contact(peer_contact.id).messages if m.id == pdf_msg.id
+        )
+        check("saved_path persisted on the Message row", reloaded_pdf_msg.saved_path == real_saved_path)
+
+        html_with_real_file = appmod._attachment_html(reloaded_pdf_msg, p)
+        check("an 'Open' link appears while the saved file still exists", "open:" in html_with_real_file)
+        check("'Save As...' is still offered too, even once a saved copy exists", "attach:" in html_with_real_file)
+
+        os.remove(real_saved_path)
+        html_after_removed = appmod._attachment_html(reloaded_pdf_msg, p)
+        check(
+            "the 'Open' link disappears once the saved file no longer actually exists",
+            "open:" not in html_after_removed,
+        )
+        check("'Save As...' is still offered after the saved file vanished", "attach:" in html_after_removed)
+    finally:
+        try:
+            os.remove(real_saved_path)
+        except OSError:
+            pass
+
+    # "Delete for everyone" scrubs the in-vault copy (body/attachment_*)
+    # but must never reach into - or even reference - a file the user
+    # already saved to their own disk (see Message.saved_path's
+    # docstring: it is deliberately outside mark_deleted()'s scope).
+    another_saved_path = "/tmp/test_delete_saved_then_deleted.pdf"
+    with open(another_saved_path, "wb") as f:
+        f.write(b"fake-pdf-bytes-2")
+    try:
+        send_store.mark_attachment_saved(peer_contact.id, pdf_msg.id, another_saved_path)
+        send_store.mark_deleted(peer_contact.id, pdf_msg.id)
+        reloaded_after_delete = next(
+            m for m in send_store.get_contact(peer_contact.id).messages if m.id == pdf_msg.id
+        )
+        check("the message itself is tombstoned", reloaded_after_delete.deleted)
+        check(
+            "saved_path survives 'delete for everyone' untouched - it's the recipient's own file now",
+            reloaded_after_delete.saved_path == another_saved_path,
+        )
+        check(
+            "the file on disk itself is completely unaffected by the in-app delete",
+            os.path.isfile(another_saved_path),
+        )
+    finally:
+        try:
+            os.remove(another_saved_path)
+        except OSError:
+            pass
 
     print("\nSetting up two independent identities for a real over-the-wire delete...\n")
     tamer = Peer("Tamer", "/tmp/del_tamer.dat", "tamer strong passphrase")

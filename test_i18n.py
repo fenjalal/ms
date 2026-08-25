@@ -177,6 +177,7 @@ def main() -> None:
     colors = theme.detect_palette(app)
 
     class FakeMessage:
+        id = "fake-msg-id"
         direction = "out"
         body = "hi"
         timestamp = "2026-01-01T00:00:00"
@@ -357,15 +358,13 @@ def main() -> None:
     # translate. status_dot is a single decorative glyph coloured entirely
     # via stylesheet; repo_link is a hyperlink built purely from the
     # constant repository URL (version.REPOSITORY), no words involved.
-    # attach_button is a single paperclip glyph, deliberately NOT wrapped in
-    # self.tr() - see its own comment in app.py: pyside6-lupdate corrupts
-    # non-BMP characters like this one when extracting from Python source,
-    # and a glyph needs no per-language translation anyway (same reasoning
-    # already applied to the lock emoji in _refresh_identity_display).
+    # (attach_button used to be a bare paperclip emoji literal here too -
+    # it's now QPushButton() with a real icons/ui/attach.png QIcon set
+    # separately, so there's no string literal left for these patterns to
+    # even match.)
     allowed_substrings = (
         'self.status_dot = QLabel("\\u25cf")',
         "repo_link = QLabel(f\"<a href='{version.REPOSITORY}'>{version.REPOSITORY}</a>\")",
-        'self.attach_button = QPushButton("\\U0001F4CE")',
     )
     suspects = []
     for i, line in enumerate(lines):

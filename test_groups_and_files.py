@@ -94,12 +94,21 @@ class Peer:
         if env.gid:
             # Mirrors app.py's MainWindow._file_incoming_group_message
             # exactly: a group this peer has no local record of at all
-            # (never created it, never redeemed an invite for it) is
-            # simply unrecognized - dropped, no auto-creation. Growing
-            # membership follows the same owner/non-owner split.
+            # is unrecognized UNLESS this envelope carries a full signed
+            # invite (env.invite, only ever attached by the owner's own
+            # onboarding send for a newly-added member - see app.py's
+            # _start_group_send) - in which case it's redeemed
+            # automatically here, same as the real app now does. Growing
+            # membership (once a Group record exists either way) follows
+            # the same owner/non-owner split as before.
             group = self.vault.get_group(env.gid)
             if group is None:
-                return
+                if not env.invite:
+                    return
+                try:
+                    group = self.vault.join_group_from_invite(env.invite)
+                except (invite_mod.GroupInviteError, ValueError):
+                    return
             already_member = contact.id in group.member_contact_ids
             removed = contact.id in group.removed_contact_ids
             if not already_member and not removed:
@@ -345,6 +354,62 @@ def main() -> None:
         # Tamer's two INCOMING messages are expected here, not three.
         "both of Tamer's incoming group messages present in Ali's thread",
         len(ali.vault.group_messages(ali_group)) == 2,
+    )
+
+    print("\nA directly-added member's app learns the group exists automatically:")
+    # This is the exact bug report this section exists to catch: Sam was
+    # named as a member at create_group() time (not invited later), so
+    # unlike Ali above, Sam's own vault never independently called
+    # join_group_from_invite() - Sam has NO local Group record at all
+    # yet, only Tamer's side knows she's a member. Before the fix, the
+    # owner's onboarding envelope only ever carried a bare invite CODE
+    # (env.invcode) - useless to a receiver with no local Group to check
+    # it against - so Sam's app silently dropped every message tagged
+    # with this gid forever, with no error and no UI cue of any kind.
+    # The fix: the onboarding envelope also carries the FULL signed
+    # invite text (env.invite), which Peer._receive (mirroring app.py's
+    # _file_incoming_group_message) now redeems automatically on arrival.
+    onboard_group = tamer.vault.create_group("Book Club", [sam_c.id])
+    check(
+        "Sam is a real member on Tamer's side immediately (direct add, no invite)",
+        sam_c.id in onboard_group.member_contact_ids,
+    )
+    check(
+        "Sam's own vault has NOT independently created this group yet",
+        sam.vault.get_group(onboard_group.id) is None,
+    )
+
+    # Mirrors app.py's _start_group_send onboarding branch exactly: mint
+    # a personal single-use invite for the pending member and attach its
+    # full signed text (not just the bare code) to the outgoing envelope.
+    onboard_invite_text = tamer.vault.create_group_invite(onboard_group.id, expiry_hours=1)
+    onboard_wire = envelope.encode_text(
+        "Welcome to the club!",
+        gid=onboard_group.id, gname=onboard_group.name,
+        invcode=invite_mod.parse_invite(onboard_invite_text).code,
+        invite=onboard_invite_text,
+    )
+    ok_onboard, _ = tamer.send_wire(sam_c, sam.port, onboard_wire)
+    check("onboarding message delivered", ok_onboard)
+    time.sleep(0.3)
+
+    sam_onboard_group = sam.vault.get_group(onboard_group.id)
+    check(
+        "Sam's app auto-created its own local Group from the embedded invite",
+        sam_onboard_group is not None,
+    )
+    check(
+        "Sam's local group is correctly owned by Tamer, not herself",
+        sam_onboard_group is not None and sam_onboard_group.owner_contact_id == tamer_c_at_sam.id,
+    )
+    check(
+        "Sam's local group has the right name",
+        sam_onboard_group is not None and sam_onboard_group.name == "Book Club",
+    )
+    check(
+        "the welcome message itself is filed under Sam's new group",
+        sam_onboard_group is not None
+        and any(m.body == "Welcome to the club!" for m in sam.vault.group_messages(sam_onboard_group)),
     )
 
     print("\nGroup ownership: only the owner can delete, others can only leave:")

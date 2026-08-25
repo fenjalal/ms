@@ -148,6 +148,22 @@ def stylesheet(p: Palette) -> str:
         background-color: {p.border};
     }}
 
+    /* Collapsed sidebar (app.py's _on_toggle_sidebar sets this dynamic
+    property on contact_list): rows are icon-only, round avatar, no text
+    label next to it - the normal filled-rectangle selection highlight
+    above looks like a stray purple square stamped behind a circle with
+    nothing there to justify a rectangle. A thin accent-colored ring
+    around the row instead reads as "this one is selected" without
+    fighting the circular avatar's own shape. */
+    QListWidget[collapsed="true"]::item:selected {{
+        background-color: transparent;
+        border: 2px solid {p.accent};
+    }}
+    QListWidget[collapsed="true"]::item:hover:!selected {{
+        background-color: transparent;
+        border: 2px solid {p.border};
+    }}
+
     /* Buttons must read as buttons: solid fill, clear border, hover feedback. */
     QPushButton {{
         background-color: {p.surface};
@@ -264,13 +280,46 @@ def stylesheet(p: Palette) -> str:
         width: 1px;
     }}
 
+    /* The VSCode-style top menu bar (app.py's MainWindow._build_menu_bar) -
+    kept as compact as the sidebar buttons right below it: tight padding
+    on both the bar itself and each top-level entry, never the default
+    Qt spacing that reads as oversized next to this app's otherwise dense
+    layout. */
+    QMenuBar {{
+        background-color: {p.window};
+        padding: 1px 0;
+        spacing: 2px;
+    }}
+    QMenuBar::item {{
+        padding: 3px 8px;
+        border-radius: 6px;
+        background: transparent;
+    }}
+    QMenuBar::item:selected {{
+        background-color: {p.border};
+    }}
+    QMenuBar::item:pressed {{
+        background-color: {p.accent};
+        color: {p.accent_text};
+    }}
+
     QMenu {{
         background-color: {p.surface};
         border: 1px solid {p.border};
+        padding: 2px;
+    }}
+    QMenu::item {{
+        padding: 4px 20px 4px 10px;
+        border-radius: 6px;
     }}
     QMenu::item:selected {{
         background-color: {p.accent};
         color: {p.accent_text};
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background: {p.border};
+        margin: 3px 6px;
     }}
 
     QScrollBar:vertical {{

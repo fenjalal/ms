@@ -164,7 +164,13 @@ def main() -> None:
         received_bytes = b64mod.b64decode(file_msg.body)
         check("received bytes match the original file exactly", received_bytes == file_data)
         check("attachment_size matches the real byte length", file_msg.attachment_size == file_size)
-        check("filename matches", file_msg.attachment_filename == os.path.basename(test_file_path))
+        check(
+            # A non-image (application/octet-stream) attachment keeps its
+            # real filename - only images get a random one (see app.py's
+            # _random_image_filename). This one round-trips unchanged.
+            "a non-image attachment's real filename round-trips unchanged",
+            file_msg.attachment_filename == os.path.basename(test_file_path),
+        )
 
     sender_contact_msgs = sender_store.get_contact(receiver_contact.id).messages
     sent_msg = next((m for m in sender_contact_msgs if m.attachment_filename), None)

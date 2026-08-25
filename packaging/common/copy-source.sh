@@ -48,10 +48,29 @@ cp "$REPO_ROOT"/icons/veilwire*.png "$DEST/icons/"
 mkdir -p "$DEST/icons/brand"
 cp "$REPO_ROOT"/icons/brand/*.png "$DEST/icons/brand/"
 
+# Small load-bearing UI icons (verified badge, person/group avatar glyph -
+# see app.py:ui_icon_path) - PNGs, not the SVGs this folder used to hold,
+# since QSvgRenderer needs the optional PySide6.QtSvg module that is not
+# guaranteed present everywhere this app runs (see app.py's ui_icon()).
+mkdir -p "$DEST/icons/ui"
+cp "$REPO_ROOT"/icons/ui/*.png "$DEST/icons/ui/"
+
 # Compiled translations only (.qm) - the .ts sources are human/agent-
 # editable development files, not needed at runtime (see i18n.py's
 # install_language(), which loads .qm directly).
 mkdir -p "$DEST/translations"
 cp "$REPO_ROOT"/translations/*.qm "$DEST/translations/"
+
+# Strip every non-pixel PNG chunk (EXIF, XMP/Adobe private chunks, text
+# comments, embedded creation timestamps, an AI tool's provenance/
+# InstanceID metadata) from every image this package ships - a source PNG
+# under icons/ can pick up any of that from whatever editor/tool produced
+# it (verified empirically: some of this repo's own brand illustrations
+# carried exactly this - see strip_image_metadata.py's docstring), and
+# none of it belongs in a distributed package regardless of which image it
+# came from. Applied here, in the one shared staging step every packaging
+# format already goes through, rather than trusted to be remembered by
+# hand before each new image is added.
+python3 "$REPO_ROOT/strip_image_metadata.py" "$DEST"/icons/*.png "$DEST"/icons/brand/*.png "$DEST"/icons/ui/*.png
 
 echo "Staged application source into $DEST"

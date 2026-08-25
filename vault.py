@@ -109,6 +109,20 @@ class Message:
     attachment_filename: str = ""
     attachment_mime: str = ""
     attachment_size: int = 0
+    # Where the user last chose to save this attachment via "Save As..."
+    # (app.py) - empty until they save it at least once. Once set, the UI
+    # offers "Open" (straight to the OS's default app for that file,
+    # nothing about the file re-read/re-verified through this app) instead
+    # of asking "Save As..." again every time, IF the file still actually
+    # exists at that path (checked at open time, not trusted blindly - the
+    # user could have moved/renamed/deleted it since saving, entirely
+    # outside this app's knowledge or control). Deliberately NOT cleared
+    # by mark_deleted()/"delete for everyone": once saved, that copy is
+    # the recipient's own file on their own disk, independent of this
+    # vault's copy - a sender deleting their in-app message can never
+    # reach into someone else's filesystem to remove a file they already
+    # saved, and this app does not attempt to pretend otherwise.
+    saved_path: str = ""
     # "Delete for everyone" (added for the message-deletion feature; default
     # False so old vault files keep loading unchanged - same migration
     # pattern as every other field on this dataclass).
@@ -1271,6 +1285,23 @@ class Vault:
                     message.note = note
                     message.attempts += 1
                     message.last_attempt = _now()
+                    self.save()
+                    return
+
+    def mark_attachment_saved(self, contact_id: str, message_id: str, saved_path: str) -> None:
+        """
+        Records where the user just saved this attachment via "Save
+        As..." (app.py) - see Message.saved_path's docstring for what
+        this is used for (offering "Open" instead of re-asking "Save
+        As..." on future visits) and why it is never touched by deletion.
+        """
+        with self._lock:
+            contact = self.get_contact(contact_id)
+            if contact is None:
+                return
+            for message in contact.messages:
+                if message.id == message_id:
+                    message.saved_path = saved_path
                     self.save()
                     return
 
